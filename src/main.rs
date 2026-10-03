@@ -2,7 +2,10 @@ use anyhow::{Result, bail};
 use nalgebra::{Matrix3, Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
 use re_lidar_slam::{
     deskew_points::deskew_points,
-    file_handler::{load_imu_data, load_pcd_files, load_pcd_xyzit, save_pcd_xyz},
+    file_handler::{
+        find_nearest_image_frame, load_image_meta, load_imu_data, load_pcd_files, load_pcd_xyzit,
+        load_rgb_image, save_pcd_xyz,
+    },
     find_nearest_points::pickup_valid_source_points,
     icp::{
         Vector6f, apply_delta, build_robust_point_to_plane_system, compute_rmse,
@@ -278,6 +281,10 @@ fn main() -> Result<()> {
     let imu_file = format!("{}/imu_data.json", imu_dir);
     let imu_data = load_imu_data(&imu_file)?;
     let imu_data = align_imu_timestamps(&imu_data); // Align IMU timestamps to seconds
+
+    let image_meta_dir = format!("{load_dir}/image");
+    let image_meta_file = format!("{}/frames.json", image_meta_dir);
+    let image_meta = load_image_meta(&image_meta_file)?;
     // <--- Loading each data --->
 
     // <--- Initialize current frame info --->
@@ -365,6 +372,56 @@ fn main() -> Result<()> {
             .map(|p| p.timestamp)
             .fold(f64::NEG_INFINITY, f64::max);
         let timestamp_time = timestamp_start.elapsed();
+
+        let current_frame_mid_time =
+            current_frame_start_time + (current_frame_end_time - current_frame_start_time) * 0.5;
+
+        // 中央時刻との差が50 ms以内の画像を採用する。
+        let max_image_time_diff_sec = 0.050;
+
+        let selected_image = find_nearest_image_frame(
+            &image_meta.frames,
+            current_frame_mid_time,
+            max_image_time_diff_sec,
+        );
+
+        if let Some(image) = selected_image {
+            let image_path = std::path::Path::new(&image_meta_dir).join(&image.file_name);
+
+            let time_diff_ms = (image.timestamp_sec - current_frame_mid_time) * 1000.0;
+
+            log::info!(
+                "Frame {i}: image={} lidar_mid={:.9} image_time={:.9} delta={:+.3} ms",
+                image_path.display(),
+                current_frame_mid_time,
+                image.timestamp_sec,
+                time_diff_ms,
+            );
+        } else {
+            log::warn!(
+                "Frame {i}: no matching image near lidar_mid={:.9}",
+                current_frame_mid_time,
+            );
+        }
+
+        let selected_rgb_image: Option<image::RgbImage> = if let Some(metadata) = selected_image {
+            let image_path = std::path::Path::new(&image_meta_dir).join(&metadata.file_name);
+
+            let rgb_image = load_rgb_image(&image_path)?;
+
+            log::info!(
+                "Frame {i}: loaded RGB image {}x{} \
+             (metadata {}x{})",
+                rgb_image.width(),
+                rgb_image.height(),
+                metadata.width,
+                metadata.height,
+            );
+
+            Some(rgb_image)
+        } else {
+            None
+        };
 
         let imu_sample_count = count_imu_samples_in_time_range(
             &imu_data,

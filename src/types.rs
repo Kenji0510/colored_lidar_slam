@@ -177,3 +177,31 @@ mod tests {
         assert_eq!(log.timing.processing_total_ms, 0.0);
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RosTimestamp {
+    pub sec: i32,
+    pub nanosec: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageFrameMetadata {
+    pub frame_index: u64,
+    pub file_name: String,
+    pub timestamp_ns: i64,
+    pub timestamp_sec: f64,
+    pub stamp: RosTimestamp,
+    pub frame_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub source_encoding: String,
+    pub source_step: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImageRecordingMetadata {
+    topic: String,
+    image_format: String,
+    frame_count: usize,
+    pub frames: Vec<ImageFrameMetadata>,
+}

@@ -1,9 +1,12 @@
-use std::{fs, path::PathBuf};
+use std::{fmt::format, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use pcd_rs::Reader;
 
-use crate::types::{LoadIMU, PointXYZ, PointXYZCov, PointXYZIT, PointXYZNormal};
+use crate::types::{
+    ImageFrameMetadata, ImageRecordingMetadata, LoadIMU, PointXYZ, PointXYZCov, PointXYZIT,
+    PointXYZNormal,
+};
 
 pub fn load_pcd_files(dir_path: &str) -> Result<Vec<PathBuf>> {
     // let re = regex::Regex::new(r"voxelized-005_frame_(\d+)\.pcd$")
@@ -54,6 +57,16 @@ pub fn load_imu_data(file_path: &str) -> Result<Vec<LoadIMU>> {
         serde_json::from_str(&data).context("Failed to parse IMU data from JSON")?;
 
     Ok(imu_data)
+}
+
+pub fn load_image_meta(file_path: &str) -> Result<ImageRecordingMetadata> {
+    let data = fs::read_to_string(file_path)
+        .context(format!("Failed to read image metadata: {}", file_path))?;
+
+    let image_meta: ImageRecordingMetadata =
+        serde_json::from_str(&data).context("Failed to parse image meta from JSON")?;
+
+    Ok(image_meta)
 }
 
 pub fn save_pcd_xyz(points: &[PointXYZ], file_path: &str) -> Result<()> {
@@ -146,4 +159,33 @@ pub fn save_pcd_xyznormal(points: &[PointXYZNormal], file_path: &str) -> Result<
     writer.finish()?;
 
     Ok(())
+}
+
+pub fn find_nearest_image_frame(
+    frames: &[ImageFrameMetadata],
+    target_time: f64,
+    max_time_diff_sec: f64,
+) -> Option<&ImageFrameMetadata> {
+    if !target_time.is_finite() || !max_time_diff_sec.is_finite() || max_time_diff_sec < 0.0 {
+        return None;
+    }
+
+    frames
+        .iter()
+        .filter(|frame| frame.timestamp_sec.is_finite())
+        .min_by(|a, b| {
+            let diff_a = (a.timestamp_sec - target_time).abs();
+            let diff_b = (b.timestamp_sec - target_time).abs();
+            diff_a.total_cmp(&diff_b)
+        })
+        .filter(|frame| (frame.timestamp_sec - target_time).abs() <= max_time_diff_sec)
+}
+
+pub fn load_rgb_image(path: &std::path::Path) -> Result<image::RgbImage> {
+    let decoded = image::ImageReader::open(path)
+        .with_context(|| format!("Failed to open image: {}", path.display()))?
+        .decode()
+        .with_context(|| format!("Failed to decode image: {}", path.display()))?;
+
+    Ok(decoded.into_rgb8())
 }
