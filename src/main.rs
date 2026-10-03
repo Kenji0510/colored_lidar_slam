@@ -20,8 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-// const DATASET_DIR: &str = "/mnt/nas/share/avia/08232026/01";
-const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/08232026/02";
+// const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
 const SAVE_ROOT_DIR: &str = "data/output/debug/08292026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +62,20 @@ impl LidarModel {
             Self::Mid70 => make_imu_to_mid70_rotation(),
             Self::Airy96 => make_imu_to_airy96_rotation(),
             Self::Avia => make_imu_to_avia_rotation(),
+        }
+    }
+
+    /// IMU原点をLiDAR座標系で表した位置。IMU積分位置からLiDAR原点位置への
+    /// レバーアーム補正（predict_pose_by_imu）に使う。既知の値がないセンサーは
+    /// ゼロ（IMUとLiDARが同一原点とみなす、従来どおりの挙動）とする。
+    fn imu_origin_in_lidar_frame_m(self) -> Vector3<f64> {
+        match self {
+            Self::Mid70 | Self::Airy96 => Vector3::zeros(),
+            Self::Avia => Vector3::new(
+                IMU_TO_AVIA_TRANSLATION_X_M,
+                IMU_TO_AVIA_TRANSLATION_Y_M,
+                IMU_TO_AVIA_TRANSLATION_Z_M,
+            ),
         }
     }
 }
@@ -127,6 +141,15 @@ const IMU_TO_AIRY96_QUAT_W: f64 = 0.00097028;
 const MID70_ORIGIN_IN_AIRY96_X_M: f64 = 0.0;
 const MID70_ORIGIN_IN_AIRY96_Y_M: f64 = 0.0;
 const MID70_ORIGIN_IN_AIRY96_Z_M: f64 = -0.06;
+
+// Livox Avia内蔵IMU座標からAvia LiDAR座標への外部回転・並進。
+// IMU原点は、LiDAR点群原点から見て以下の位置にある：
+// Translation (x, y, z) : -0.04165, -0.02326, 0.02840  [m]
+// 回転軸はLiDARと一致しているため回転は単位回転になる。この並進はIMU積分位置を
+// LiDAR原点位置へ変換するレバーアーム補正に使う（predict_pose_by_imu参照）。
+const IMU_TO_AVIA_TRANSLATION_X_M: f64 = -0.04165;
+const IMU_TO_AVIA_TRANSLATION_Y_M: f64 = -0.02326;
+const IMU_TO_AVIA_TRANSLATION_Z_M: f64 = 0.02840;
 
 // Mid-70 is sparser than Airy-96. Keep enough spatial support in each local-map
 // cell for stable pose estimation; the stricter filters below are used to keep
@@ -233,6 +256,7 @@ fn main() -> Result<()> {
     let load_dir = format!("{DATASET_DIR}/{}", lidar_model.input_subdir());
     let save_dir = format!("{SAVE_ROOT_DIR}/{}", lidar_model.name());
     let imu_to_lidar = lidar_model.imu_to_lidar_rotation();
+    let imu_origin_in_lidar_frame = lidar_model.imu_origin_in_lidar_frame_m();
     log::info!(
         "LiDAR model={}, input={}, output={}",
         lidar_model.name(),
@@ -365,6 +389,7 @@ fn main() -> Result<()> {
         let pose_prediction = predict_pose_by_imu(
             &imu_data,
             &imu_to_lidar,
+            &imu_origin_in_lidar_frame,
             &current_frame_info.current_global_pose,
             &current_frame_info.current_velocity,
             prev_frame_start_time,
@@ -1262,7 +1287,8 @@ fn make_imu_to_airy96_rotation() -> UnitQuaternion<f64> {
 }
 
 /// Livox Avia内蔵IMU座標からLiDAR座標への回転を返す。
-/// Aviaの内蔵IMUとLiDARの座標軸は同じ向きなので、回転は単位回転になる。
+/// Aviaの内蔵IMUとLiDARの座標軸は同じ向きなので、回転は単位回転になる
+/// （IMU-LiDAR間の並進はファイル冒頭のコメントを参照）。
 fn make_imu_to_avia_rotation() -> UnitQuaternion<f64> {
     UnitQuaternion::identity()
 }

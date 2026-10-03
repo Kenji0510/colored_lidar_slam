@@ -30,9 +30,17 @@ const G: f64 = 9.80665;
 
 /// `static_gravity_g`: センサ静止時のlinear_acceleration計測値（g単位）。
 /// 初期ボディフレーム＝ワールドフレームとして、この方向をワールド重力として固定除去する。
+///
+/// `imu_origin_in_lidar_frame`: IMU原点をLiDAR座標系で表した位置（レバーアーム）。
+/// 加速度計はIMU原点自身の並進運動を計測するため、積分はIMU原点の軌跡
+/// （t_world_imu）に対して行い、開始・終了時にLiDAR原点位置（t_world_lidar）との
+/// 間で変換する：
+///   t_world_imu   = t_world_lidar + R_world_lidar * imu_origin_in_lidar_frame
+///   t_world_lidar = t_world_imu   - R_world_lidar * imu_origin_in_lidar_frame
 pub fn predict_pose_by_imu(
     imu_data: &Vec<IMU>,
     imu_to_lidar: &UnitQuaternion<f64>,
+    imu_origin_in_lidar_frame: &Vector3<f64>,
     prev_pose: &Matrix4<f64>,
     prev_velocity: &Vector3<f64>,
     prev_timestamp: f64,
@@ -41,10 +49,12 @@ pub fn predict_pose_by_imu(
     let tx = prev_pose[(0, 3)];
     let ty = prev_pose[(1, 3)];
     let tz = prev_pose[(2, 3)];
-    let mut position = Vector3::new(tx, ty, tz);
+    let lidar_translation = Vector3::new(tx, ty, tz);
 
     let mat3 = prev_pose.fixed_view::<3, 3>(0, 0).into_owned();
     let mut rotation = UnitQuaternion::from_matrix(&mat3);
+    // IMU原点の軌跡を積分するため、開始位置をLiDAR原点位置からIMU原点位置へ変換する。
+    let mut position = lidar_translation + rotation * imu_origin_in_lidar_frame;
     let mut velocity = *prev_velocity;
 
     // LiDARが水平な状態を前提とする
@@ -105,6 +115,9 @@ pub fn predict_pose_by_imu(
         last_time = sample.timestamp;
     }
 
+    // IMU原点の軌跡からLiDAR原点位置へ変換して返す。
+    let lidar_position = position - rotation * imu_origin_in_lidar_frame;
+
     let rotation_matrix = rotation.to_rotation_matrix();
     let mut delta_transform = Matrix4::<f64>::identity();
     delta_transform
@@ -112,7 +125,7 @@ pub fn predict_pose_by_imu(
         .copy_from(&rotation_matrix.matrix());
     delta_transform
         .fixed_view_mut::<3, 1>(0, 3)
-        .copy_from(&position);
+        .copy_from(&lidar_position);
 
     (delta_transform, velocity)
 }
@@ -201,6 +214,7 @@ mod tests {
         let (pose, velocity) = predict_pose_by_imu(
             &imu_data,
             &UnitQuaternion::identity(),
+            &Vector3::zeros(),
             &Matrix4::identity(),
             &Vector3::zeros(),
             0.0,
@@ -211,5 +225,34 @@ mod tests {
         assert!(pose[(1, 3)].abs() < 1e-9);
         assert!(pose[(2, 3)].abs() < 1e-6);
         assert!((velocity.x - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lever_arm_offset_rotates_lidar_position_during_pure_yaw() {
+        // Pure yaw at rest: the accelerometer keeps reading exactly 1g on Z,
+        // so the IMU origin does not translate in world frame. Only the
+        // LiDAR-origin position, reconstructed via the lever arm, should move
+        // as the body rotates.
+        let imu_data = vec![IMU {
+            timestamp: 1.0,
+            angular_velocity: [0.0, 0.0, std::f64::consts::FRAC_PI_2 as f32],
+            linear_acceleration: [0.0, 0.0, 1.0],
+        }];
+        let imu_origin_in_lidar_frame = Vector3::new(1.0, 0.0, 0.0);
+
+        let (pose, velocity) = predict_pose_by_imu(
+            &imu_data,
+            &UnitQuaternion::identity(),
+            &imu_origin_in_lidar_frame,
+            &Matrix4::identity(),
+            &Vector3::zeros(),
+            0.0,
+            1.0,
+        );
+
+        assert!(velocity.norm() < 1e-6);
+        assert!((pose[(0, 3)] - 1.0).abs() < 1e-6);
+        assert!((pose[(1, 3)] - (-1.0)).abs() < 1e-6);
+        assert!(pose[(2, 3)].abs() < 1e-6);
     }
 }
