@@ -61,15 +61,17 @@ pub fn predict_pose_by_imu(
     let gravity = Vector3::new(0.0, 0.0, G);
 
     // 前回のフレームの終わりから今回のフレームの終わりまでのIMUデータを抽出
-    let relevant_imu_data: Vec<&IMU> = imu_data
-        .iter()
-        .filter(|s| s.timestamp >= prev_timestamp && s.timestamp <= current_timestamp)
-        .collect();
+    let relevant_imu_data = imu_data.iter().filter(|s| s.timestamp >= prev_timestamp);
 
     let mut last_time = prev_timestamp;
 
     for sample in relevant_imu_data {
-        let dt = sample.timestamp - last_time;
+        if last_time >= current_timestamp {
+            break;
+        }
+
+        let step_end_time = sample.timestamp.min(current_timestamp);
+        let dt = step_end_time - last_time;
         if dt <= 1e-9 {
             continue;
         }
@@ -112,7 +114,7 @@ pub fn predict_pose_by_imu(
         velocity += acc_world * dt;
 
         // Update last_time for the next iteration
-        last_time = sample.timestamp;
+        last_time = step_end_time;
     }
 
     // IMU原点の軌跡からLiDAR原点位置へ変換して返す。

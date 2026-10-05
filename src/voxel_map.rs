@@ -147,6 +147,8 @@ pub struct VoxelCell {
     // Mean of this voxel coordinates.
     pub mean: Point3<f32>,
 
+    pub rgb: Option<[u8; 3]>,
+
     // Welford法の共分散計算用の中間値
     pub m2: Matrix3<f32>,
 
@@ -209,6 +211,15 @@ pub struct LOCALMap {
 impl LOCALMap {
     pub fn new(config: LocalMapConfig) -> Self {
         Self::with_voxel_capacity(config, 0)
+    }
+
+    pub fn update_world_map_filtered(
+        &mut self,
+        source_points: &[Point3<f32>],
+        global_pose: &Matrix4<f64>,
+        filter_config: &WorldMapUpdateFilterConfig,
+    ) -> WorldMapUpdateStats {
+        self.update_world_map_filtered_with_rgb(source_points, None, global_pose, filter_config)
     }
 
     pub fn with_voxel_capacity(config: LocalMapConfig, voxel_capacity: usize) -> Self {
@@ -351,12 +362,20 @@ impl LOCALMap {
     ///
     /// pending は GlobalMap/ICP/PCD 出力には使わない。現在の目的は壁の厚み抑制を
     /// 優先するため、近接した平行面を自動昇格させず、期限切れで破棄する。
-    pub fn update_world_map_filtered(
+    pub fn update_world_map_filtered_with_rgb(
         &mut self,
         source_points: &[Point3<f32>],
+        source_rgb: Option<&[Option<[u8; 3]>]>,
         global_pose: &Matrix4<f64>,
         filter_config: &WorldMapUpdateFilterConfig,
     ) -> WorldMapUpdateStats {
+        if let Some(colors) = source_rgb {
+            assert_eq!(
+                source_points.len(),
+                colors.len(),
+                "source_points と source_rgb の要素数が異なります"
+            );
+        }
         assert!(filter_config.accept_distance_m.is_finite());
         assert!(filter_config.accept_distance_m > 0.0);
         assert!(filter_config.pending_distance_m.is_finite());
@@ -388,13 +407,21 @@ impl LOCALMap {
         let voxel_size = self.config.index_voxel_size;
         let mut accepted_frame_voxels = std::mem::take(&mut self.frame_voxel_scratch);
         accepted_frame_voxels.clear();
+        // このフレームで採用したボクセルごとの代表色
+        let mut accepted_frame_colors: FxHashMap<VoxelKey, [u8; 3]> = FxHashMap::default();
         let mut pending_frame_voxels: FxHashMap<VoxelKey, (Vector3<f32>, usize)> =
             FxHashMap::default();
 
-        for decision in decisions {
+        for (index, decision) in decisions.into_iter().enumerate() {
+            let rgb = source_rgb.and_then(|colors| colors[index]);
             match decision {
                 WorldPointUpdateDecision::InsertProvisional(point) => {
                     accumulate_frame_voxel(&mut accepted_frame_voxels, point, voxel_size);
+                    if let Some(rgb) = rgb {
+                        accepted_frame_colors
+                            .entry(voxel_key(&point, voxel_size))
+                            .or_insert(rgb);
+                    }
                     self.pending_voxel_map
                         .remove(&voxel_key(&point, voxel_size));
                     stats.inserted_provisional += 1;
@@ -404,6 +431,11 @@ impl LOCALMap {
                     insertion,
                 } => {
                     accumulate_frame_voxel(&mut accepted_frame_voxels, insertion, voxel_size);
+                    if let Some(rgb) = rgb {
+                        accepted_frame_colors
+                            .entry(voxel_key(&insertion, voxel_size))
+                            .or_insert(rgb);
+                    }
                     self.pending_voxel_map
                         .remove(&voxel_key(&original, voxel_size));
                     stats.projected_to_mature_plane += 1;
@@ -436,6 +468,12 @@ impl LOCALMap {
             }
         }
         let frame_entry = self.insert_frame_voxels(accepted_frame_voxels, origin);
+        // 座標を統合したボクセルへ、採用点の色を保存
+        for (key, rgb) in accepted_frame_colors {
+            if let Some(cell) = self.voxel_map.get_mut(&key) {
+                cell.set_color_if_missing(Some(rgb));
+            }
+        }
         self.frame_index.push_back(frame_entry);
 
         self.pending_voxel_map.retain(|_, pending| {
@@ -1552,6 +1590,8 @@ impl VoxelCell {
             is_point: true,
             mean: Point3::origin(),
 
+            rgb: None,
+
             m2: Matrix3::zeros(),
             sample_count: 0,
             observed_frames: 0,
@@ -1579,6 +1619,8 @@ impl VoxelCell {
             point: (point, frame_id),
             is_point: true,
 
+            rgb: None,
+
             mean: point,
             m2: Matrix3::zeros(),
             sample_count: 1,
@@ -1594,6 +1636,12 @@ impl VoxelCell {
             surface_plane: None,
             surface_evaluation_epoch: 0,
             surface_evaluated_through_frame_id: None,
+        }
+    }
+
+    pub fn set_color_if_missing(&mut self, rgb: Option<[u8; 3]>) {
+        if self.rgb.is_none() {
+            self.rgb = rgb;
         }
     }
 
@@ -2107,7 +2155,7 @@ mod tests {
         let mut map = LOCALMap::new(map_config());
         insert_mature_yz_plane_cell(&mut map);
 
-        let stats = map.update_world_map_filtered(
+        let stats = map.update_world_map_filtered_with_rgb(
             &[Point3::new(0.015, 0.01, 0.01)],
             &Matrix4::<f64>::identity(),
             &world_update_filter_config(),
@@ -2132,7 +2180,7 @@ mod tests {
         insert_mature_yz_plane_cell(&mut map);
         let original_voxel_count = map.voxel_map.len();
 
-        let stats = map.update_world_map_filtered(
+        let stats = map.update_world_map_filtered_with_rgb(
             &[Point3::new(0.07, 0.01, 0.01)],
             &Matrix4::<f64>::identity(),
             &world_update_filter_config(),
@@ -2153,7 +2201,7 @@ mod tests {
     fn filtered_world_update_keeps_new_structure_without_nearby_mature_plane() {
         let mut map = LOCALMap::new(map_config());
 
-        let stats = map.update_world_map_filtered(
+        let stats = map.update_world_map_filtered_with_rgb(
             &[Point3::new(1.0, 0.0, 0.0)],
             &Matrix4::<f64>::identity(),
             &world_update_filter_config(),

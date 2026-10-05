@@ -2,6 +2,7 @@ pub mod convert_imu_data;
 pub mod deskew_points;
 pub mod file_handler;
 // pub mod find_nearest_correspondece;
+pub mod camera;
 pub mod find_nearest_points;
 pub mod icp;
 pub mod predict_pose_by_imu;

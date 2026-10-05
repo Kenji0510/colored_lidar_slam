@@ -1,10 +1,13 @@
 use anyhow::{Result, bail};
 use nalgebra::{Matrix3, Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
 use re_lidar_slam::{
+    camera::{
+        CameraIntrinsics, build_camera_from_lidar, colorize_world_points, project_camera_point,
+    },
     deskew_points::deskew_points,
     file_handler::{
         find_nearest_image_frame, load_image_meta, load_imu_data, load_pcd_files, load_pcd_xyzit,
-        load_rgb_image, save_pcd_xyz,
+        load_rgb_image, save_pcd_xyz, save_pcd_xyzrgb,
     },
     find_nearest_points::pickup_valid_source_points,
     icp::{
@@ -12,7 +15,7 @@ use re_lidar_slam::{
         compute_robust_cost, solve_icp_delta_observable,
     },
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
-    types::{CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, SLAMMap},
+    types::{CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap},
     voxel_map::{
         LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus, WorldMapUpdateFilterConfig,
     },
@@ -23,9 +26,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/08232026/02";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/10042026/04";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
-const SAVE_ROOT_DIR: &str = "data/output/debug/08292026";
+const SAVE_ROOT_DIR: &str = "data/output/10042026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LidarModel {
@@ -282,7 +285,7 @@ fn main() -> Result<()> {
     let imu_data = load_imu_data(&imu_file)?;
     let imu_data = align_imu_timestamps(&imu_data); // Align IMU timestamps to seconds
 
-    let image_meta_dir = format!("{load_dir}/image");
+    let image_meta_dir = format!("{DATASET_DIR}/camera");
     let image_meta_file = format!("{}/frames.json", image_meta_dir);
     let image_meta = load_image_meta(&image_meta_file)?;
     // <--- Loading each data --->
@@ -349,6 +352,13 @@ fn main() -> Result<()> {
 
     let mut prev_frame_start_time: f64 = 0.0;
     let mut frame_logs: Vec<FrameLog> = Vec::new();
+
+    let camera_from_lidar = build_camera_from_lidar(
+        Vector3::new(0.04, 0.0, 0.05), // カメラ位置 [m]
+        0.0,                           // roll [deg]
+        -1.8,                           // pitch [deg]
+        -2.2,                          // yaw [deg]
+    );
 
     //
     for (i, pcd_path) in pcd_files.iter().enumerate() {
@@ -857,6 +867,109 @@ fn main() -> Result<()> {
 
         current_frame_info.current_global_pose = new_global_pose;
         current_frame_info.current_velocity = new_velocity;
+
+        let lidar_pose_at_image_time: Option<Matrix4<f64>> =
+            if let (Some(metadata), Some(_)) = (selected_image, selected_rgb_image.as_ref()) {
+                let image_time = metadata.timestamp_sec;
+
+                let imu_covers_interval = imu_data
+                    .first()
+                    .is_some_and(|s| s.timestamp <= current_frame_start_time)
+                    && imu_data.last().is_some_and(|s| s.timestamp >= image_time);
+
+                if image_time < current_frame_start_time || !imu_covers_interval {
+                    log::warn!("Frame {i}: cannot predict image pose at {:.9}", image_time,);
+                    None
+                } else {
+                    let (pose, _) = predict_pose_by_imu(
+                        &imu_data,
+                        &imu_to_lidar,
+                        &imu_origin_in_lidar_frame,
+                        &current_frame_info.current_global_pose,
+                        &current_frame_info.current_velocity,
+                        current_frame_start_time,
+                        image_time,
+                    );
+
+                    log::info!(
+                        "Frame {i}: image pose dt={:.3} ms, \
+                 position=[{:.3}, {:.3}, {:.3}]",
+                        (image_time - current_frame_start_time) * 1000.0,
+                        pose[(0, 3)],
+                        pose[(1, 3)],
+                        pose[(2, 3)],
+                    );
+
+                    Some(pose)
+                }
+            } else {
+                None
+            };
+
+        let camera_from_world_at_image: Option<Matrix4<f64>> = lidar_pose_at_image_time
+            .as_ref()
+            .and_then(|world_from_lidar| {
+                world_from_lidar
+                    .try_inverse()
+                    .map(|lidar_from_world| camera_from_lidar * lidar_from_world)
+            });
+
+        if let Some(transform) = &camera_from_world_at_image {
+            log::debug!("Frame {i}: camera_from_world_at_image=\n{}", transform,);
+        }
+
+        let projected_pixels = if let (Some(rgb_image), Some(camera_from_world)) = (
+            selected_rgb_image.as_ref(),
+            camera_from_world_at_image.as_ref(),
+        ) {
+            let intrinsics =
+                CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
+
+            // 開始時刻基準の点群 → 世界座標 → 画像時刻のカメラ座標。
+            let camera_from_lidar_start =
+                camera_from_world * current_frame_info.current_global_pose;
+
+            let pixels: Vec<Option<(u32, u32)>> = deskewed_points
+                .iter()
+                .map(|point| {
+                    let camera_point =
+                        camera_from_lidar_start.transform_point(&point.cast::<f64>());
+
+                    project_camera_point(&camera_point, &intrinsics)
+                })
+                .collect();
+
+            log::info!(
+                "Frame {i}: projection candidates={}/{} image={}x{}",
+                pixels.iter().flatten().count(),
+                pixels.len(),
+                intrinsics.width,
+                intrinsics.height,
+            );
+
+            Some(pixels)
+        } else {
+            None
+        };
+
+        let colored_world_points = colorize_world_points(
+            &deskewed_points,
+            &current_frame_info.current_global_pose,
+            selected_rgb_image.as_ref(),
+            projected_pixels.as_deref(),
+        )?;
+
+        let colored_count = colored_world_points
+            .iter()
+            .filter(|point| point.rgb.is_some())
+            .count();
+
+        log::info!(
+            "Frame {i}: colored={} uncolored={} total={}",
+            colored_count,
+            colored_world_points.len() - colored_count,
+            colored_world_points.len(),
+        );
         // --- Update current frame info ---
 
         // --- Record frame log ---
@@ -908,13 +1021,54 @@ fn main() -> Result<()> {
         };
         let global_filter_time = global_filter_start.elapsed();
 
+        let global_source_rgb: Option<Vec<Option<[u8; 3]>>> = match (
+            map_update_allowed,
+            selected_rgb_image.as_ref(),
+            camera_from_world_at_image.as_ref(),
+        ) {
+            (true, Some(rgb_image), Some(camera_from_world)) => {
+                let intrinsics =
+                    CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
+
+                // LiDARフレーム開始時の座標 → 画像撮影時のカメラ座標
+                let camera_from_lidar_start =
+                    camera_from_world * current_frame_info.current_global_pose;
+
+                let colors: Vec<Option<[u8; 3]>> = global_source_points
+                    .iter()
+                    .map(|point| {
+                        let camera_point =
+                            camera_from_lidar_start.transform_point(&point.cast::<f64>());
+
+                        project_camera_point(&camera_point, &intrinsics)
+                            .and_then(|(u, v)| rgb_image.get_pixel_checked(u, v))
+                            .map(|pixel| pixel.0)
+                    })
+                    .collect();
+
+                let colored_count = colors.iter().filter(|color| color.is_some()).count();
+
+                log::debug!(
+                    "Frame {i}: GlobalMap input RGB: {} / {} points",
+                    colored_count,
+                    global_source_points.len(),
+                );
+
+                Some(colors)
+            }
+            _ => None,
+        };
+
         let global_map_update_start = Instant::now();
         let global_update_stats = if map_update_allowed {
-            slam_map.global_voxel_map.update_world_map_filtered(
-                &global_source_points,
-                &current_frame_info.current_global_pose,
-                &world_map_update_filter_config,
-            )
+            slam_map
+                .global_voxel_map
+                .update_world_map_filtered_with_rgb(
+                    &global_source_points,
+                    global_source_rgb.as_deref(),
+                    &current_frame_info.current_global_pose,
+                    &world_map_update_filter_config,
+                )
         } else {
             Default::default()
         };
@@ -1102,6 +1256,36 @@ fn main() -> Result<()> {
         final_surface_stats.unknown,
         final_surface_start.elapsed(),
     );
+
+    let planar_world_map_rgb: Vec<PointXYZRGB> = slam_map
+        .global_voxel_map
+        .voxel_map
+        .values()
+        .filter(|cell| {
+            cell.sample_count >= min_samples
+                && cell.observed_frames >= min_frames
+                && cell.surface_status == SurfaceStatus::Planar
+                && cell.mean.coords.iter().all(|value| value.is_finite())
+        })
+        .filter_map(|cell| cell.rgb.map(|rgb| PointXYZRGB::new(cell.mean, rgb)))
+        .collect();
+
+    let planar_world_map_rgb_path = format!(
+        "{}/voxel-{}_world_map_rgb.pcd",
+        save_dir, GLOBAL_MAP_VOXEL_SIZE,
+    );
+
+    if planar_world_map_rgb.is_empty() {
+        log::info!("RGB export skipped: no colored planar points");
+    } else {
+        save_pcd_xyzrgb(&planar_world_map_rgb, &planar_world_map_rgb_path)?;
+
+        log::info!(
+            "Saved colored planar world map: {} points → {}",
+            planar_world_map_rgb.len(),
+            planar_world_map_rgb_path,
+        );
+    }
 
     let planar_world_map_points: Vec<Point3<f32>> = slam_map
         .global_voxel_map

@@ -205,3 +205,30 @@ pub struct ImageRecordingMetadata {
     frame_count: usize,
     pub frames: Vec<ImageFrameMetadata>,
 }
+
+#[derive(Debug, Clone)]
+pub struct ColoredPoint {
+    pub position: Point3<f32>, // 世界座標
+    pub rgb: Option<[u8; 3]>,
+}
+
+#[derive(Debug, Clone, PcdDeserialize, PcdSerialize)]
+pub struct PointXYZRGB {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub rgb: f32,
+}
+
+impl PointXYZRGB {
+    pub fn new(position: Point3<f32>, rgb: [u8; 3]) -> Self {
+        let packed_rgb = ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | (rgb[2] as u32);
+
+        Self {
+            x: position.x,
+            y: position.y,
+            z: position.z,
+            rgb: f32::from_bits(packed_rgb),
+        }
+    }
+}
