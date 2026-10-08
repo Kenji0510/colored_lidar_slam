@@ -83,8 +83,9 @@ pub struct ProcessTimes {
 /// Wall-clock timings for one point-cloud frame, in milliseconds.
 ///
 /// The top-level stages do not overlap and can therefore be compared directly.
-/// The `icp_*` detail fields are a breakdown of `icp_ms` and must not be added
-/// to the top-level stages a second time.
+/// The `icp_*` detail fields are a breakdown of `icp_ms`, and the `coloring_*`
+/// detail fields are a breakdown of `coloring_ms`; neither must be added to the
+/// top-level stages a second time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FrameTiming {
@@ -101,6 +102,8 @@ pub struct FrameTiming {
     pub global_map_update_ms: f64,
     pub delayed_surface_ms: f64,
     pub local_map_update_ms: f64,
+    /// Total time spent coloring the registered frame (sum of `coloring_*`).
+    pub coloring_ms: f64,
     /// Per-frame processing time excluding PCD file I/O.
     pub processing_total_ms: f64,
     /// Per-frame wall time including PCD file I/O.
@@ -113,6 +116,18 @@ pub struct FrameTiming {
     pub icp_solver_ms: f64,
     /// Remaining ICP work, calculated from `icp_ms`.
     pub icp_other_ms: f64,
+    /// Time spent finding the image nearest to the LiDAR mid-time.
+    pub coloring_image_select_ms: f64,
+    /// Time spent loading and decoding the selected RGB image.
+    pub coloring_image_load_ms: f64,
+    /// Time spent predicting the LiDAR/camera pose at the image timestamp.
+    pub coloring_image_pose_ms: f64,
+    /// Time spent projecting deskewed points into the image.
+    pub coloring_projection_ms: f64,
+    /// Time spent sampling image colors for the deskewed frame points.
+    pub coloring_colorize_ms: f64,
+    /// Time spent sampling image colors for the GlobalMap input points.
+    pub coloring_global_rgb_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

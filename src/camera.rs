@@ -2,6 +2,9 @@ use nalgebra::{Matrix3, Matrix4, Point3, Rotation3, Vector3};
 
 use crate::types::ColoredPoint;
 
+// 画像の縦横それぞれ、中央75%だけを着色に使用する
+const COLOR_IMAGE_KEEP_RATIO: f64 = 0.75;
+
 /// LiDAR座標の点をカメラ座標へ変換する行列。
 /// camera_position_in_lidar_m は、LiDARから見たカメラ原点位置。
 pub fn build_camera_from_lidar(
@@ -87,13 +90,14 @@ pub fn project_camera_point(point: &Point3<f64>, camera: &CameraIntrinsics) -> O
     let u = (camera.fx * xd + camera.cx).round();
     let v = (camera.fy * yd + camera.cy).round();
 
-    if !u.is_finite()
-        || !v.is_finite()
-        || u < 0.0
-        || v < 0.0
-        || u >= camera.width as f64
-        || v >= camera.height as f64
-    {
+    let width = camera.width as f64;
+    let height = camera.height as f64;
+
+    let margin_ratio = (1.0 - COLOR_IMAGE_KEEP_RATIO) * 0.5;
+    let margin_x = width * margin_ratio;
+    let margin_y = height * margin_ratio;
+
+    if u < margin_x || u >= width - margin_x || v < margin_y || v >= height - margin_y {
         return None;
     }
 

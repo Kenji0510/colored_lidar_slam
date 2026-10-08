@@ -43,7 +43,7 @@ fn main() -> Result<()> {
 
 type TimingAccessor = fn(&FrameTiming) -> f64;
 
-const TIMING_STAGES: [(&str, TimingAccessor); 13] = [
+const TIMING_STAGES: [(&str, TimingAccessor); 14] = [
     ("load PCD", |t| t.load_pcd_ms),
     ("timestamps", |t| t.timestamps_ms),
     ("IMU predict", |t| t.imu_predict_ms),
@@ -57,6 +57,7 @@ const TIMING_STAGES: [(&str, TimingAccessor); 13] = [
     ("global update", |t| t.global_map_update_ms),
     ("surface", |t| t.delayed_surface_ms),
     ("local update", |t| t.local_map_update_ms),
+    ("coloring", |t| t.coloring_ms),
 ];
 
 const ICP_TIMING_STAGES: [(&str, TimingAccessor); 4] = [
@@ -66,11 +67,20 @@ const ICP_TIMING_STAGES: [(&str, TimingAccessor); 4] = [
     ("other", |t| t.icp_other_ms),
 ];
 
+const COLORING_TIMING_STAGES: [(&str, TimingAccessor); 6] = [
+    ("image select", |t| t.coloring_image_select_ms),
+    ("image load", |t| t.coloring_image_load_ms),
+    ("image pose", |t| t.coloring_image_pose_ms),
+    ("projection", |t| t.coloring_projection_ms),
+    ("colorize", |t| t.coloring_colorize_ms),
+    ("global RGB", |t| t.coloring_global_rgb_ms),
+];
+
 fn plot_processing_times(logs: &[FrameLog], out_dir: &str) -> Result<()> {
     let path = format!("{}/processing_times.png", out_dir);
-    let root = BitMapBackend::new(&path, (1600, 1400)).into_drawing_area();
+    let root = BitMapBackend::new(&path, (1600, 1850)).into_drawing_area();
     root.fill(&WHITE)?;
-    let panels = root.split_evenly((3, 1));
+    let panels = root.split_evenly((4, 1));
 
     let processing: Vec<(f32, f32)> = logs
         .iter()
@@ -189,39 +199,63 @@ fn plot_processing_times(logs: &[FrameLog], out_dir: &str) -> Result<()> {
         .border_style(BLACK)
         .draw()?;
 
-    let icp_stats: Vec<(f64, f64)> = ICP_TIMING_STAGES
+    draw_breakdown_panel(
+        &panels[2],
+        "ICP timing breakdown",
+        "ICP stage",
+        &ICP_TIMING_STAGES,
+        logs,
+    )?;
+    draw_breakdown_panel(
+        &panels[3],
+        "Coloring timing breakdown",
+        "Coloring stage",
+        &COLORING_TIMING_STAGES,
+        logs,
+    )?;
+
+    root.present()?;
+    println!("  processing_times.png");
+    Ok(())
+}
+
+fn draw_breakdown_panel(
+    area: &DrawingArea<BitMapBackend, plotters::coord::Shift>,
+    caption: &str,
+    x_desc: &str,
+    stages: &[(&str, TimingAccessor)],
+    logs: &[FrameLog],
+) -> Result<()> {
+    let stats: Vec<(f64, f64)> = stages
         .iter()
         .map(|(_, get)| mean_and_percentile(logs, *get, 0.95))
         .collect();
-    let icp_y_max = icp_stats
+    let y_max = stats
         .iter()
         .flat_map(|(mean, p95)| [*mean, *p95])
         .fold(0.0f64, f64::max)
         .max(1.0) as f32;
-    let mut icp_chart = ChartBuilder::on(&panels[2])
-        .caption("ICP timing breakdown", ("sans-serif", 22).into_font())
+    let mut chart = ChartBuilder::on(area)
+        .caption(caption, ("sans-serif", 22).into_font())
         .margin(15)
         .x_label_area_size(55)
         .y_label_area_size(70)
-        .build_cartesian_2d(
-            -0.5f32..ICP_TIMING_STAGES.len() as f32 - 0.5,
-            0f32..icp_y_max * 1.12,
-        )?;
-    icp_chart
+        .build_cartesian_2d(-0.5f32..stages.len() as f32 - 0.5, 0f32..y_max * 1.12)?;
+    chart
         .configure_mesh()
-        .x_labels(ICP_TIMING_STAGES.len())
+        .x_labels(stages.len())
         .x_label_formatter(&|value| {
             let index = value.round() as isize;
-            if index >= 0 && (index as usize) < ICP_TIMING_STAGES.len() {
-                ICP_TIMING_STAGES[index as usize].0.to_string()
+            if index >= 0 && (index as usize) < stages.len() {
+                stages[index as usize].0.to_string()
             } else {
                 String::new()
             }
         })
-        .x_desc("ICP stage")
+        .x_desc(x_desc)
         .y_desc("Wall time [ms]")
         .draw()?;
-    icp_chart.draw_series(icp_stats.iter().enumerate().map(|(index, (mean, _))| {
+    chart.draw_series(stats.iter().enumerate().map(|(index, (mean, _))| {
         Rectangle::new(
             [
                 (index as f32 - 0.34, 0.0),
@@ -230,7 +264,7 @@ fn plot_processing_times(logs: &[FrameLog], out_dir: &str) -> Result<()> {
             BLUE.filled(),
         )
     }))?;
-    icp_chart.draw_series(icp_stats.iter().enumerate().map(|(index, (_, p95))| {
+    chart.draw_series(stats.iter().enumerate().map(|(index, (_, p95))| {
         Rectangle::new(
             [
                 (index as f32 + 0.02, 0.0),
@@ -239,9 +273,6 @@ fn plot_processing_times(logs: &[FrameLog], out_dir: &str) -> Result<()> {
             RED.mix(0.7).filled(),
         )
     }))?;
-
-    root.present()?;
-    println!("  processing_times.png");
     Ok(())
 }
 
@@ -268,6 +299,12 @@ fn print_timing_ranking(logs: &[FrameLog]) {
 
     println!("ICP timing breakdown [ms]:");
     for (name, get) in ICP_TIMING_STAGES {
+        let (mean, p95) = mean_and_percentile(logs, get, 0.95);
+        println!("  {:<22} mean={:>9.3}, p95={:>9.3}", name, mean, p95);
+    }
+
+    println!("Coloring timing breakdown [ms]:");
+    for (name, get) in COLORING_TIMING_STAGES {
         let (mean, p95) = mean_and_percentile(logs, get, 0.95);
         println!("  {:<22} mean={:>9.3}, p95={:>9.3}", name, mean, p95);
     }

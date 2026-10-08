@@ -26,7 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/10042026/04";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/10042026/03";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
 const SAVE_ROOT_DIR: &str = "data/output/10042026";
 
@@ -356,7 +356,7 @@ fn main() -> Result<()> {
     let camera_from_lidar = build_camera_from_lidar(
         Vector3::new(0.04, 0.0, 0.05), // カメラ位置 [m]
         0.0,                           // roll [deg]
-        -1.8,                           // pitch [deg]
+        -1.8,                          // pitch [deg]
         -2.2,                          // yaw [deg]
     );
 
@@ -389,11 +389,13 @@ fn main() -> Result<()> {
         // 中央時刻との差が50 ms以内の画像を採用する。
         let max_image_time_diff_sec = 0.050;
 
+        let coloring_image_select_start = Instant::now();
         let selected_image = find_nearest_image_frame(
             &image_meta.frames,
             current_frame_mid_time,
             max_image_time_diff_sec,
         );
+        let coloring_image_select_time = coloring_image_select_start.elapsed();
 
         if let Some(image) = selected_image {
             let image_path = std::path::Path::new(&image_meta_dir).join(&image.file_name);
@@ -414,6 +416,7 @@ fn main() -> Result<()> {
             );
         }
 
+        let coloring_image_load_start = Instant::now();
         let selected_rgb_image: Option<image::RgbImage> = if let Some(metadata) = selected_image {
             let image_path = std::path::Path::new(&image_meta_dir).join(&metadata.file_name);
 
@@ -432,6 +435,7 @@ fn main() -> Result<()> {
         } else {
             None
         };
+        let coloring_image_load_time = coloring_image_load_start.elapsed();
 
         let imu_sample_count = count_imu_samples_in_time_range(
             &imu_data,
@@ -867,7 +871,10 @@ fn main() -> Result<()> {
 
         current_frame_info.current_global_pose = new_global_pose;
         current_frame_info.current_velocity = new_velocity;
+        let pose_state_update_time = pose_update_start.elapsed();
 
+        // --- Colorize the registered frame ---
+        let coloring_image_pose_start = Instant::now();
         let lidar_pose_at_image_time: Option<Matrix4<f64>> =
             if let (Some(metadata), Some(_)) = (selected_image, selected_rgb_image.as_ref()) {
                 let image_time = metadata.timestamp_sec;
@@ -917,7 +924,9 @@ fn main() -> Result<()> {
         if let Some(transform) = &camera_from_world_at_image {
             log::debug!("Frame {i}: camera_from_world_at_image=\n{}", transform,);
         }
+        let coloring_image_pose_time = coloring_image_pose_start.elapsed();
 
+        let coloring_projection_start = Instant::now();
         let projected_pixels = if let (Some(rgb_image), Some(camera_from_world)) = (
             selected_rgb_image.as_ref(),
             camera_from_world_at_image.as_ref(),
@@ -951,7 +960,9 @@ fn main() -> Result<()> {
         } else {
             None
         };
+        let coloring_projection_time = coloring_projection_start.elapsed();
 
+        let coloring_colorize_start = Instant::now();
         let colored_world_points = colorize_world_points(
             &deskewed_points,
             &current_frame_info.current_global_pose,
@@ -970,9 +981,12 @@ fn main() -> Result<()> {
             colored_world_points.len() - colored_count,
             colored_world_points.len(),
         );
+        let coloring_colorize_time = coloring_colorize_start.elapsed();
+        // --- Colorize the registered frame ---
         // --- Update current frame info ---
 
         // --- Record frame log ---
+        let frame_log_record_start = Instant::now();
         let translation_m = (new_pos - prev_pos).norm();
         let delta_r = r64 * prev_r.transpose();
         let rotation_deg = ((delta_r.trace() - 1.0) / 2.0)
@@ -986,7 +1000,9 @@ fn main() -> Result<()> {
         };
         let map_update_allowed = local_map_was_empty || icp_ok;
         // --- Record frame log ---
-        let pose_update_time = pose_update_start.elapsed();
+        // Coloring is reported separately, so pose_update covers only the pose
+        // state update and the frame-log bookkeeping around it.
+        let pose_update_time = pose_state_update_time + frame_log_record_start.elapsed();
 
         // --- Filter valid source points, then update the WorldMap ---
         // ローカルマップが空（初回フレーム）の場合はフィルタなしで全点追加。
@@ -1021,6 +1037,7 @@ fn main() -> Result<()> {
         };
         let global_filter_time = global_filter_start.elapsed();
 
+        let coloring_global_rgb_start = Instant::now();
         let global_source_rgb: Option<Vec<Option<[u8; 3]>>> = match (
             map_update_allowed,
             selected_rgb_image.as_ref(),
@@ -1058,6 +1075,7 @@ fn main() -> Result<()> {
             }
             _ => None,
         };
+        let coloring_global_rgb_time = coloring_global_rgb_start.elapsed();
 
         let global_map_update_start = Instant::now();
         let global_update_stats = if map_update_allowed {
@@ -1121,6 +1139,12 @@ fn main() -> Result<()> {
         let measured_icp_detail =
             icp_correspondence_search_time + icp_linear_system_time + icp_solver_time;
         let icp_other_time = loop_end.saturating_sub(measured_icp_detail);
+        let coloring_time = coloring_image_select_time
+            + coloring_image_load_time
+            + coloring_image_pose_time
+            + coloring_projection_time
+            + coloring_colorize_time
+            + coloring_global_rgb_time;
         let timing = FrameTiming {
             load_pcd_ms: duration_ms(load_pcd_time),
             timestamps_ms: duration_ms(timestamp_time),
@@ -1135,20 +1159,27 @@ fn main() -> Result<()> {
             global_map_update_ms: duration_ms(global_map_update_time),
             delayed_surface_ms: duration_ms(delayed_surface_time),
             local_map_update_ms: duration_ms(local_map_update_time),
+            coloring_ms: duration_ms(coloring_time),
             processing_total_ms: duration_ms(frame_processing_time),
             total_with_file_io_ms: duration_ms(frame_total_with_file_io),
             icp_correspondence_search_ms: duration_ms(icp_correspondence_search_time),
             icp_linear_system_ms: duration_ms(icp_linear_system_time),
             icp_solver_ms: duration_ms(icp_solver_time),
             icp_other_ms: duration_ms(icp_other_time),
+            coloring_image_select_ms: duration_ms(coloring_image_select_time),
+            coloring_image_load_ms: duration_ms(coloring_image_load_time),
+            coloring_image_pose_ms: duration_ms(coloring_image_pose_time),
+            coloring_projection_ms: duration_ms(coloring_projection_time),
+            coloring_colorize_ms: duration_ms(coloring_colorize_time),
+            coloring_global_rgb_ms: duration_ms(coloring_global_rgb_time),
         };
         log::debug!(
             "Frame {i} timings [ms]: load_pcd={:.3} ms, timestamps={:.3} ms, \
              imu_predict={:.3} ms, rotation_trajectory={:.3} ms, deskew={:.3} ms, \
              downsample={:.3} ms, build_source_maps={:.3} ms, icp={:.3} ms, \
              pose_update={:.3} ms, global_filter={:.3} ms, global_map_update={:.3} ms, \
-             delayed_surface={:.3} ms, local_map_update={:.3} ms, total={:.3} ms \
-             (with_file_io={:.3} ms)",
+             delayed_surface={:.3} ms, local_map_update={:.3} ms, coloring={:.3} ms, \
+             total={:.3} ms (with_file_io={:.3} ms)",
             duration_ms(load_pcd_time),
             duration_ms(timestamp_time),
             duration_ms(predict_pose_time),
@@ -1162,8 +1193,21 @@ fn main() -> Result<()> {
             duration_ms(global_map_update_time),
             duration_ms(delayed_surface_time),
             duration_ms(local_map_update_time),
+            duration_ms(coloring_time),
             duration_ms(frame_processing_time),
             duration_ms(frame_total_with_file_io),
+        );
+        log::debug!(
+            "Frame {i} coloring breakdown [ms]: image_select={:.3} ms, image_load={:.3} ms, \
+             image_pose={:.3} ms, projection={:.3} ms, colorize={:.3} ms, \
+             global_rgb={:.3} ms, total={:.3} ms",
+            timing.coloring_image_select_ms,
+            timing.coloring_image_load_ms,
+            timing.coloring_image_pose_ms,
+            timing.coloring_projection_ms,
+            timing.coloring_colorize_ms,
+            timing.coloring_global_rgb_ms,
+            timing.coloring_ms,
         );
         log::debug!(
             "Frame {i} ICP breakdown [ms]: correspondence_search={:.3}, \
@@ -1354,7 +1398,7 @@ fn log_timing_summary(frame_logs: &[FrameLog]) {
         return;
     }
 
-    let stages: [(&str, fn(&FrameTiming) -> f64); 13] = [
+    let stages: [(&str, fn(&FrameTiming) -> f64); 14] = [
         ("load_pcd", |t| t.load_pcd_ms),
         ("timestamps", |t| t.timestamps_ms),
         ("imu_predict", |t| t.imu_predict_ms),
@@ -1368,6 +1412,7 @@ fn log_timing_summary(frame_logs: &[FrameLog]) {
         ("global_map_update", |t| t.global_map_update_ms),
         ("delayed_surface", |t| t.delayed_surface_ms),
         ("local_map_update", |t| t.local_map_update_ms),
+        ("coloring", |t| t.coloring_ms),
     ];
     let mut summaries: Vec<TimingStats> = stages
         .into_iter()
@@ -1434,6 +1479,39 @@ fn log_timing_summary(frame_logs: &[FrameLog]) {
         };
         log::info!(
             "ICP timing: {:<21} mean={:>9.3} ms ({:>5.1}% of ICP), p95={:>9.3} ms, max={:>9.3} ms",
+            summary.name,
+            summary.mean_ms,
+            share,
+            summary.p95_ms,
+            summary.max_ms,
+        );
+    }
+
+    let coloring_details: [(&str, fn(&FrameTiming) -> f64); 6] = [
+        ("image_select", |t| t.coloring_image_select_ms),
+        ("image_load", |t| t.coloring_image_load_ms),
+        ("image_pose", |t| t.coloring_image_pose_ms),
+        ("projection", |t| t.coloring_projection_ms),
+        ("colorize", |t| t.coloring_colorize_ms),
+        ("global_rgb", |t| t.coloring_global_rgb_ms),
+    ];
+    let coloring_mean = summaries
+        .iter()
+        .find(|summary| summary.name == "coloring")
+        .map_or(0.0, |summary| summary.mean_ms);
+    let mut coloring_summaries: Vec<TimingStats> = coloring_details
+        .into_iter()
+        .map(|(name, get)| timing_stats(name, frame_logs, get))
+        .collect();
+    coloring_summaries.sort_by(|left, right| right.mean_ms.total_cmp(&left.mean_ms));
+    for summary in coloring_summaries {
+        let share = if coloring_mean > 0.0 {
+            summary.mean_ms / coloring_mean * 100.0
+        } else {
+            0.0
+        };
+        log::info!(
+            "Coloring timing: {:<16} mean={:>9.3} ms ({:>5.1}% of coloring), p95={:>9.3} ms, max={:>9.3} ms",
             summary.name,
             summary.mean_ms,
             share,
