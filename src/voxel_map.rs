@@ -149,6 +149,8 @@ pub struct VoxelCell {
 
     pub rgb: Option<[u8; 3]>,
 
+    pub color_observation_distance_m: Option<f64>,
+
     // Welford法の共分散計算用の中間値
     pub m2: Matrix3<f32>,
 
@@ -365,7 +367,7 @@ impl LOCALMap {
     pub fn update_world_map_filtered_with_rgb(
         &mut self,
         source_points: &[Point3<f32>],
-        source_rgb: Option<&[Option<[u8; 3]>]>,
+        source_rgb: Option<&[Option<ColorObservation>]>,
         global_pose: &Matrix4<f64>,
         filter_config: &WorldMapUpdateFilterConfig,
     ) -> WorldMapUpdateStats {
@@ -408,16 +410,16 @@ impl LOCALMap {
         let mut accepted_frame_voxels = std::mem::take(&mut self.frame_voxel_scratch);
         accepted_frame_voxels.clear();
         // このフレームで採用したボクセルごとの代表色
-        let mut accepted_frame_colors: FxHashMap<VoxelKey, [u8; 3]> = FxHashMap::default();
+        let mut accepted_frame_colors: FxHashMap<VoxelKey, ColorObservation> = FxHashMap::default();
         let mut pending_frame_voxels: FxHashMap<VoxelKey, (Vector3<f32>, usize)> =
             FxHashMap::default();
 
         for (index, decision) in decisions.into_iter().enumerate() {
-            let rgb = source_rgb.and_then(|colors| colors[index]);
+            let observation = source_rgb.and_then(|colors| colors[index]);
             match decision {
                 WorldPointUpdateDecision::InsertProvisional(point) => {
                     accumulate_frame_voxel(&mut accepted_frame_voxels, point, voxel_size);
-                    if let Some(rgb) = rgb {
+                    if let Some(rgb) = observation {
                         accepted_frame_colors
                             .entry(voxel_key(&point, voxel_size))
                             .or_insert(rgb);
@@ -431,11 +433,18 @@ impl LOCALMap {
                     insertion,
                 } => {
                     accumulate_frame_voxel(&mut accepted_frame_voxels, insertion, voxel_size);
-                    if let Some(rgb) = rgb {
+                    if let Some(rgb) = observation {
                         accepted_frame_colors
                             .entry(voxel_key(&insertion, voxel_size))
                             .or_insert(rgb);
                     }
+
+                    accumulate_frame_color(
+                        &mut accepted_frame_colors,
+                        &insertion,
+                        voxel_size,
+                        observation,
+                    );
                     self.pending_voxel_map
                         .remove(&voxel_key(&original, voxel_size));
                     stats.projected_to_mature_plane += 1;
@@ -469,11 +478,17 @@ impl LOCALMap {
         }
         let frame_entry = self.insert_frame_voxels(accepted_frame_voxels, origin);
         // 座標を統合したボクセルへ、採用点の色を保存
-        for (key, rgb) in accepted_frame_colors {
+        let mut updated_color_voxels = 0usize;
+
+        for (key, observation) in accepted_frame_colors {
             if let Some(cell) = self.voxel_map.get_mut(&key) {
-                cell.set_color_if_missing(Some(rgb));
+                if cell.update_color_if_closer(observation) {
+                    updated_color_voxels += 1;
+                }
             }
         }
+
+        log::debug!("GlobalMap color updates: {} voxels", updated_color_voxels,);
         self.frame_index.push_back(frame_entry);
 
         self.pending_voxel_map.retain(|_, pending| {
@@ -1022,6 +1037,37 @@ impl LOCALMap {
 
         self.surface_evaluation_epoch
     }
+}
+
+/// 同じボクセルに入る色候補から、最も近い観測を残す。
+fn accumulate_frame_color(
+    frame_colors: &mut FxHashMap<VoxelKey, ColorObservation>,
+    point: &Point3<f32>,
+    voxel_size: f32,
+    observation: Option<ColorObservation>,
+) {
+    let Some(observation) = observation else {
+        return;
+    };
+
+    if !point.coords.iter().all(|value| value.is_finite()) {
+        return;
+    }
+
+    if !observation.distance_m.is_finite() || observation.distance_m <= 0.0 {
+        return;
+    }
+
+    let key = voxel_key(point, voxel_size);
+
+    frame_colors
+        .entry(key)
+        .and_modify(|stored| {
+            if observation.distance_m < stored.distance_m {
+                *stored = observation;
+            }
+        })
+        .or_insert(observation);
 }
 
 #[derive(Default)]
@@ -1583,6 +1629,12 @@ fn accumulate_frame_voxel(
         .or_insert((point.coords, 1));
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ColorObservation {
+    pub rgb: [u8; 3],
+    pub distance_m: f64,
+}
+
 impl VoxelCell {
     pub fn new() -> Self {
         Self {
@@ -1591,6 +1643,8 @@ impl VoxelCell {
             mean: Point3::origin(),
 
             rgb: None,
+
+            color_observation_distance_m: None,
 
             m2: Matrix3::zeros(),
             sample_count: 0,
@@ -1621,6 +1675,8 @@ impl VoxelCell {
 
             rgb: None,
 
+            color_observation_distance_m: None,
+
             mean: point,
             m2: Matrix3::zeros(),
             sample_count: 1,
@@ -1639,10 +1695,33 @@ impl VoxelCell {
         }
     }
 
-    pub fn set_color_if_missing(&mut self, rgb: Option<[u8; 3]>) {
-        if self.rgb.is_none() {
-            self.rgb = rgb;
+    // pub fn set_color_if_missing(&mut self, rgb: Option<[u8; 3]>) {
+    //     if self.rgb.is_none() {
+    //         self.rgb = rgb;
+    //     }
+    // }
+
+    pub fn update_color_if_closer(&mut self, observation: ColorObservation) -> bool {
+        let new_distance_m = observation.distance_m;
+
+        if !new_distance_m.is_finite() || new_distance_m <= 0.0 {
+            return false;
         }
+
+        let should_update = self.rgb.is_none()
+            || self
+                .color_observation_distance_m
+                .map_or(true, |stored_distance_m| new_distance_m < stored_distance_m);
+
+        if !should_update {
+            return false;
+        }
+
+        // 色と、その色を取得した観測距離を必ず同時に更新する。
+        self.rgb = Some(observation.rgb);
+        self.color_observation_distance_m = Some(new_distance_m);
+
+        true
     }
 
     pub fn update_statistics(

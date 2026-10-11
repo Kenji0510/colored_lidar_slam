@@ -17,7 +17,8 @@ use re_lidar_slam::{
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
     types::{CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap},
     voxel_map::{
-        LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus, WorldMapUpdateFilterConfig,
+        ColorObservation, LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus,
+        WorldMapUpdateFilterConfig,
     },
     voxelization::{voxel_downsample_points, voxel_downsample_points_and_maps_dual},
 };
@@ -26,7 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/10042026/03";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/10042026/05";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
 const SAVE_ROOT_DIR: &str = "data/output/10042026";
 
@@ -1038,7 +1039,7 @@ fn main() -> Result<()> {
         let global_filter_time = global_filter_start.elapsed();
 
         let coloring_global_rgb_start = Instant::now();
-        let global_source_rgb: Option<Vec<Option<[u8; 3]>>> = match (
+        let global_source_rgb: Option<Vec<Option<ColorObservation>>> = match (
             map_update_allowed,
             selected_rgb_image.as_ref(),
             camera_from_world_at_image.as_ref(),
@@ -1051,15 +1052,25 @@ fn main() -> Result<()> {
                 let camera_from_lidar_start =
                     camera_from_world * current_frame_info.current_global_pose;
 
-                let colors: Vec<Option<[u8; 3]>> = global_source_points
+                let colors: Vec<Option<ColorObservation>> = global_source_points
                     .iter()
                     .map(|point| {
                         let camera_point =
                             camera_from_lidar_start.transform_point(&point.cast::<f64>());
 
-                        project_camera_point(&camera_point, &intrinsics)
-                            .and_then(|(u, v)| rgb_image.get_pixel_checked(u, v))
-                            .map(|pixel| pixel.0)
+                        let (u, v) = project_camera_point(&camera_point, &intrinsics)?;
+
+                        let rgb = rgb_image.get_pixel_checked(u, v)?.0;
+
+                        // カメラ座標の原点は、画像撮影時のカメラ位置。
+                        // この点の長さが、カメラから対象点までの距離になる。
+                        let distance_m = camera_point.coords.norm();
+
+                        if !distance_m.is_finite() || distance_m <= 0.0 {
+                            return None;
+                        }
+
+                        Some(ColorObservation { rgb, distance_m })
                     })
                     .collect();
 
