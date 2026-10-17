@@ -27,9 +27,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/10042026/05";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/10122026/06";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
-const SAVE_ROOT_DIR: &str = "data/output/10042026";
+const SAVE_ROOT_DIR: &str = "data/output/10122026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LidarModel {
@@ -163,7 +163,7 @@ const IMU_TO_AVIA_TRANSLATION_Z_M: f64 = 0.02840;
 // wall/ground boundary points out of the global map.
 const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.25; // m
 const LOCAL_MAP_VOXEL_SIZE: f32 = 0.25; // m
-const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.05; // m
+const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.025; // m
 // このセンサー構成では、走行全体で 1 フレームあたり約 1800 個の GlobalMap
 // voxel が増える。入力フレーム数から最終容量を先に確保し、実行途中の巨大な
 // HashMap 再配置（数百 ms のスパイク）を避ける。
