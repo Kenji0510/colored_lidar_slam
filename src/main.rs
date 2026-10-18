@@ -3,31 +3,23 @@ use nalgebra::{Matrix3, Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
 use re_lidar_slam::{
     camera::{
         CameraIntrinsics, build_camera_from_lidar, colorize_world_points, project_camera_point,
-    },
-    deskew_points::deskew_points,
-    file_handler::{
+    }, deskew_points::deskew_points, file_handler::{
         find_nearest_image_frame, load_image_meta, load_imu_data, load_pcd_files, load_pcd_xyzit,
         load_rgb_image, save_pcd_xyz, save_pcd_xyzrgb,
-    },
-    find_nearest_points::pickup_valid_source_points,
-    icp::{
+    }, find_nearest_points::pickup_valid_source_points, hybrid::{HybridRefineConfig, refine_hybrid_pose}, icp::{
         Vector6f, apply_delta, build_robust_point_to_plane_system, compute_rmse,
         compute_robust_cost, solve_icp_delta_observable,
-    },
-    predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
-    types::{CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap},
-    voxel_map::{
+    }, predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu}, types::{CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap}, voxel_map::{
         ColorObservation, LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus,
         WorldMapUpdateFilterConfig,
-    },
-    voxelization::{voxel_downsample_points, voxel_downsample_points_and_maps_dual},
+    }, voxelization::{voxel_downsample_points, voxel_downsample_points_and_maps_dual},
 };
 use std::{
     ffi::OsString,
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/10122026/06";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/10122026/02";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
 const SAVE_ROOT_DIR: &str = "data/output/10122026";
 
@@ -236,6 +228,7 @@ const ICP_VERTICAL_RECOVERY_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.0;
 const ICP_VERTICAL_RECOVERY_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.60;
 const ICP_VERTICAL_RECOVERY_MAX_TRANSLATION_CORRECTION_M: f32 = 0.60;
 const MIN_IMU_SAMPLES_PER_POINT_CLOUD_FRAME: usize = 5;
+const HYBRID_REFINE_ENABLED: bool = true;
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 150.0;
 
@@ -816,6 +809,144 @@ fn main() -> Result<()> {
                     && final_rmse
                         .is_some_and(|rmse| rmse.is_finite() && rmse <= ICP_MAX_FINAL_RMSE_M);
                 if !final_quality_ok {
+                    // if !final_quality_ok { ... } の直後へ追加する。
+                    if icp_ok && HYBRID_REFINE_ENABLED {
+                        let hybrid_start = Instant::now();
+                        let config = HybridRefineConfig {
+                            point_weight: 0.3,
+                            // max_point_distance_m: 0.05,
+                            max_translation_m: 0.12,
+                            iterations: 5,
+                            damping: ICP_DAMPING,
+                            relative_eigenvalue_threshold: ICP_RELATIVE_EIGENVALUE_THRESHOLD,
+                            ..Default::default()
+                        };
+                        match refine_hybrid_pose(
+                            &source_voxel_map,
+                            &slam_map.local_voxel_map.voxel_map,
+                            slam_map.local_voxel_map.config.index_voxel_size,
+                            &correspondences,
+                            &r_mat,
+                            &t_vec,
+                            ICP_HUBER_DELTA_M,
+                            &config,
+                        ) {
+                            Ok(refined) => {
+                                // 候補姿勢のまま評価し、ここではまだ r_mat/t_vec を書き換えない。
+                                let (prediction_dt, prediction_dr) = pose_correction_magnitudes(
+                                    &pred_r,
+                                    &pred_t,
+                                    &refined.rotation,
+                                    &refined.translation,
+                                );
+                                let max_prediction_dt = if vertical_recovery_pose {
+                                    ICP_VERTICAL_RECOVERY_MAX_TRANSLATION_CORRECTION_M
+                                } else {
+                                    ICP_MAX_TRANSLATION_CORRECTION_M
+                                };
+                                let prediction_ok = prediction_dt.is_finite()
+                                    && prediction_dr.is_finite()
+                                    && prediction_dt <= max_prediction_dt
+                                    && prediction_dr <= ICP_MAX_ROTATION_CORRECTION_DEG;
+
+                                let check_search_start = Instant::now();
+                                let refined_correspondences =
+                                    pickup_valid_source_points::<LOCAL_KNN_K>(
+                                        &source_voxel_map,
+                                        &slam_map.local_voxel_map.voxel_map,
+                                        slam_map.local_voxel_map.config.index_voxel_size,
+                                        SEARCH_RANGE,
+                                        MAX_DIST_FACTOR,
+                                        LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
+                                        LOCAL_SOURCE_PLANE_SCORE_THRESHOLD,
+                                        Some(LOCAL_SOURCE_TO_PLANE_MAX_DISTANCE_M),
+                                        Some(LOCAL_MIN_PLANARITY),
+                                        &refined.rotation,
+                                        &refined.translation,
+                                    );
+                                icp_correspondence_search_time += check_search_start.elapsed();
+                                let refined_rmse = compute_rmse(
+                                    &refined_correspondences,
+                                    &refined.rotation,
+                                    &refined.translation,
+                                );
+
+                                let check_system_start = Instant::now();
+                                let refined_system = build_robust_point_to_plane_system(
+                                    &refined_correspondences,
+                                    &refined.rotation,
+                                    &refined.translation,
+                                    ICP_HUBER_DELTA_M,
+                                );
+                                icp_linear_system_time += check_system_start.elapsed();
+                                let check_solve_start = Instant::now();
+                                let refined_solve = solve_icp_delta_observable(
+                                    &refined_system,
+                                    ICP_DAMPING,
+                                    ICP_RELATIVE_EIGENVALUE_THRESHOLD,
+                                );
+                                icp_solver_time += check_solve_start.elapsed();
+
+                                // 新しい対応でも、前段の平面対応数の90%以上を保つ。
+                                let required_count = min_correspondences
+                                    .max((correspondences.len() as f32 * 0.90).ceil() as usize);
+                                // Point-to-Point が作る見かけのフルランクではなく、平面だけで判定。
+                                let retained_rank = refined_solve
+                                    .as_ref()
+                                    .map_or(0, |solve| solve.observable_rank);
+                                let quality_ok = prediction_ok
+                                    && refined_correspondences.len() >= required_count
+                                    && retained_rank >= final_observable_rank
+                                    && refined_rmse.is_finite()
+                                    && refined_rmse <= ICP_MAX_FINAL_RMSE_M;
+
+                                if quality_ok {
+                                    r_mat = refined.rotation;
+                                    t_vec = refined.translation;
+                                    final_rmse = Some(refined_rmse);
+                                    final_correspondence_count = refined_correspondences.len();
+                                    final_correspondence_ratio = final_correspondence_count as f32
+                                        / source_point_count.max(1) as f32;
+                                    final_observable_rank = retained_rank;
+                                    final_eigenvalue_ratio = refined_solve
+                                        .as_ref()
+                                        .map(|solve| solve.min_observable_eigenvalue_ratio);
+                                    log::info!(
+                                        "Frame {i}: hybrid accepted: steps={}, point_matches={}, \
+                                     extra_t={:.4} m, extra_r={:.3} deg, \
+                                     fixed_point_rmse={:.4}->{:.4} m, \
+                                     fixed_plane_rmse={:.4}->{:.4} m",
+                                        refined.accepted_steps,
+                                        refined.point_matches,
+                                        refined.translation_correction_m,
+                                        refined.rotation_correction_deg,
+                                        refined.point_rmse_before_m,
+                                        refined.point_rmse_after_m,
+                                        refined.plane_rmse_before_m,
+                                        refined.plane_rmse_after_m,
+                                    );
+                                } else {
+                                    log::info!(
+                                        "Frame {i}: hybrid rejected; keeping plane pose: \
+                                     prediction_ok={prediction_ok}, plane_matches={} (min {}), \
+                                     plane_rank={} (min {}), rmse={:.4} m",
+                                        refined_correspondences.len(),
+                                        required_count,
+                                        retained_rank,
+                                        final_observable_rank,
+                                        refined_rmse,
+                                    );
+                                }
+                            }
+                            Err(reason) => {
+                                log::info!(
+                                    "Frame {i}: hybrid skipped; keeping plane pose: {reason}"
+                                );
+                            }
+                        }
+                        log::debug!("Frame {i}: hybrid stage took {:?}", hybrid_start.elapsed());
+                    }
+
                     log::warn!(
                         "Frame {i}: final ICP quality rejected: correspondences={} (min {}), \
                          rank={}, rmse={:?}",

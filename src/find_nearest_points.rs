@@ -219,7 +219,7 @@ fn neighbor_is_better(left: (&VoxelCell, f32), right: (&VoxelCell, f32)) -> bool
 ///
 /// 候補全件の Vec とソートは作らず、固定長配列上で近い `K` 件だけを
 /// 挿入ソートする。`K` 個未満しか見つからなければ None。
-fn find_k_nearest_target_voxels<'a, const K: usize>(
+pub fn find_k_nearest_target_voxels<'a, const K: usize>(
     query_point: &Point3<f32>,
     target_map: &'a VoxelMap,
     voxel_size: f32,
