@@ -163,6 +163,34 @@ pub struct FrameLog {
     pub pose_z: f64,
     #[serde(default)]
     pub timing: FrameTiming,
+    /// ESKF の LiDAR 更新を採用したか（false なら IMU 予測のみ）。
+    #[serde(default)]
+    pub eskf_update_applied: bool,
+    /// 推定ジャイロバイアス（LiDAR 軸）[rad/s]。
+    #[serde(default)]
+    pub gyro_bias_radps: [f64; 3],
+    /// 推定加速度バイアス（LiDAR 軸）[m/s²]。
+    #[serde(default)]
+    pub accel_bias_mps2: [f64; 3],
+    /// ワールド座標の速度 [m/s]。
+    #[serde(default)]
+    pub velocity_mps: [f64; 3],
+    /// 以下、更新後の共分散の対角から求めた標準偏差。
+    #[serde(default)]
+    pub attitude_std_deg: [f64; 3],
+    #[serde(default)]
+    pub position_std_m: [f64; 3],
+    #[serde(default)]
+    pub velocity_std_mps: [f64; 3],
+    #[serde(default)]
+    pub gyro_bias_std_radps: [f64; 3],
+    #[serde(default)]
+    pub accel_bias_std_mps2: [f64; 3],
+    /// 収束点での事前項 (x ⊟ x_pred)ᵀ P⁻¹ (x ⊟ x_pred)。
+    /// おおむね 15 以下が目安。常に大きく超えるなら IMU ノイズ設定が小さすぎ
+    /// （予測を信用しすぎ）。
+    #[serde(default)]
+    pub eskf_prior_cost: Option<f64>,
 }
 
 #[cfg(test)]

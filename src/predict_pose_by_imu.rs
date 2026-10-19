@@ -28,6 +28,9 @@ pub struct PosePrediction {
 
 const G: f64 = 9.80665;
 
+/// 注: ESKF 導入後、main の予測は `eskf::Eskf::propagate`（バイアス除去・共分散伝播つき）に
+/// 置き換わった。この関数は比較・テスト用に残している。
+///
 /// `static_gravity_g`: センサ静止時のlinear_acceleration計測値（g単位）。
 /// 初期ボディフレーム＝ワールドフレームとして、この方向をワールド重力として固定除去する。
 ///
@@ -151,11 +154,16 @@ pub fn get_imu_range(
 
 pub type RotationTrajectory = Vec<(f64, UnitQuaternion<f64>)>;
 
+/// deskew 用に、フレーム開始時刻を基準とした相対回転の軌跡を作る。
+///
+/// `gyro_bias_body`: ESKF が推定したジャイロバイアス（LiDAR 軸に回した後の値）。
+/// 角速度を LiDAR 軸へ回してから差し引く。ESKF を使わない場合はゼロを渡す。
 pub fn build_rotation_trajectory(
     imu_data: &Vec<IMU>,
     start_time: f64,
     end_time: f64,
     imu_to_lidar: &UnitQuaternion<f64>,
+    gyro_bias_body: &Vector3<f64>,
 ) -> RotationTrajectory {
     let mut trajectory = Vec::new();
     let mut current_rotation = UnitQuaternion::<f64>::identity();
@@ -183,7 +191,7 @@ pub fn build_rotation_trajectory(
             sample.angular_velocity[1] as f64,
             sample.angular_velocity[2] as f64,
         );
-        let omega = imu_to_lidar * omega;
+        let omega = imu_to_lidar * omega - gyro_bias_body;
 
         let angle_axis = omega * dt;
         let delta_q = UnitQuaternion::new(angle_axis);

@@ -5,16 +5,20 @@ use re_lidar_slam::{
         CameraIntrinsics, build_camera_from_lidar, colorize_world_points, project_camera_point,
     },
     deskew_points::deskew_points,
+    eskf::{
+        Eskf, EskfConfig, ImuModel, ImuNoise, InitialStd, NavState, STANDARD_GRAVITY_MPS2,
+        StaticInitConfig, estimate_static_init,
+    },
     file_handler::{
         find_nearest_image_frame, load_image_meta, load_imu_data, load_pcd_files, load_pcd_xyzit,
         load_rgb_image, save_pcd_xyz, save_pcd_xyzrgb,
     },
     find_nearest_points::pickup_valid_source_points,
     icp::{
-        Vector6f, apply_delta, build_robust_point_to_plane_system, compute_rmse,
-        compute_robust_cost, solve_icp_delta_observable,
+        Vector6f, build_robust_point_to_plane_system, compute_rmse, compute_robust_cost,
+        solve_icp_delta_observable,
     },
-    predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
+    predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory},
     types::{CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap},
     voxel_map::{
         ColorObservation, LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus,
@@ -27,9 +31,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/10122026/06";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/10042026/02";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
-const SAVE_ROOT_DIR: &str = "data/output/10122026";
+const SAVE_ROOT_DIR: &str = "data/output/10042026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LidarModel {
@@ -239,6 +243,113 @@ const MIN_IMU_SAMPLES_PER_POINT_CLOUD_FRAME: usize = 5;
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 150.0;
 
+// --- ESKF ---
+// IMU ノイズ密度。データシート値（例: BMI088 はジャイロ約 2.4e-4 rad/s/√Hz、
+// 加速度約 1.7e-3 m/s²/√Hz）に、車体振動などの余裕として 5〜10 倍を掛けた値から始める。
+const IMU_GYRO_NOISE_DENSITY: f64 = 2.0e-3; // rad/s/√Hz
+const IMU_ACCEL_NOISE_DENSITY: f64 = 2.0e-2; // m/s²/√Hz
+const IMU_GYRO_BIAS_RANDOM_WALK: f64 = 5.0e-5; // rad/s²/√Hz
+const IMU_ACCEL_BIAS_RANDOM_WALK: f64 = 5.0e-4; // m/s³/√Hz
+// point-to-plane 残差 1点あたりの標準偏差。IMU ノイズとの「比」が挙動を決める。
+const LIDAR_POINT_SIGMA_M: f64 = 0.05;
+// 初期共分散。加速度バイアスは最初は小さめにして、p・R・v・b_g の安定を優先する。
+const INIT_ATTITUDE_STD_DEG: f64 = 0.5;
+const INIT_POSITION_STD_M: f64 = 0.01;
+const INIT_VELOCITY_STD_MPS: f64 = 0.05;
+const INIT_GYRO_BIAS_STD_RADPS: f64 = 0.005;
+const INIT_ACCEL_BIAS_STD_MPS2: f64 = 0.02;
+// 先頭の静止区間からの初期化（重力方向・ジャイロバイアス）。
+const STATIC_INIT_WINDOW_S: f64 = 1.0;
+const STATIC_INIT_MIN_SAMPLES: usize = 50;
+const STATIC_INIT_MAX_GYRO_STD_RADPS: f64 = 0.02;
+const STATIC_INIT_MAX_ACCEL_STD_MPS2: f64 = 0.15;
+const STATIC_INIT_NORMALIZE_ACCEL_MAGNITUDE: bool = true;
+
+fn make_eskf_config() -> EskfConfig {
+    EskfConfig {
+        imu_noise: ImuNoise {
+            gyro_noise_density: IMU_GYRO_NOISE_DENSITY,
+            accel_noise_density: IMU_ACCEL_NOISE_DENSITY,
+            gyro_bias_random_walk: IMU_GYRO_BIAS_RANDOM_WALK,
+            accel_bias_random_walk: IMU_ACCEL_BIAS_RANDOM_WALK,
+        },
+        initial_std: InitialStd {
+            attitude_rad: INIT_ATTITUDE_STD_DEG.to_radians(),
+            position_m: INIT_POSITION_STD_M,
+            velocity_mps: INIT_VELOCITY_STD_MPS,
+            gyro_bias_radps: INIT_GYRO_BIAS_STD_RADPS,
+            accel_bias_mps2: INIT_ACCEL_BIAS_STD_MPS2,
+        },
+        gravity_mps2: STANDARD_GRAVITY_MPS2,
+        lidar_point_sigma_m: LIDAR_POINT_SIGMA_M,
+    }
+}
+
+/// 最初のフレーム開始時刻で ESKF を作る。
+///
+/// 静止区間が取れれば、重力方向に合わせた初期姿勢（マップの z 軸が真上になる）と
+/// ジャイロバイアスで初期化する。取れなければ従来どおり「水平・バイアス 0」とする。
+fn initialize_eskf(
+    imu_data: &[IMU],
+    imu_to_lidar: UnitQuaternion<f64>,
+    imu_origin_in_lidar_frame: Vector3<f64>,
+    first_frame_start_time: f64,
+) -> Eskf {
+    let config = make_eskf_config();
+    // IMU の加速度は g 単位（従来の predict_pose_by_imu と同じ前提）。
+    let mut imu_model = ImuModel::new(imu_to_lidar, STANDARD_GRAVITY_MPS2);
+    let mut initial_state = NavState::default();
+
+    let static_init_config = StaticInitConfig {
+        window_s: STATIC_INIT_WINDOW_S,
+        min_samples: STATIC_INIT_MIN_SAMPLES,
+        max_gyro_std_radps: STATIC_INIT_MAX_GYRO_STD_RADPS,
+        max_accel_std_mps2: STATIC_INIT_MAX_ACCEL_STD_MPS2,
+        normalize_accel_magnitude: STATIC_INIT_NORMALIZE_ACCEL_MAGNITUDE,
+    };
+
+    match estimate_static_init(
+        imu_data,
+        &imu_model,
+        first_frame_start_time,
+        &static_init_config,
+        config.gravity_mps2,
+    ) {
+        Ok(init) => {
+            let (roll, pitch, _) = init.rotation.euler_angles();
+            log::info!(
+                "ESKF static init: samples={}, roll={:.3} deg, pitch={:.3} deg, \
+                 gyro_bias=[{:.5}, {:.5}, {:.5}] rad/s, |a|={:.4} m/s^2 \
+                 (scale correction {:.5}), gyro_std={:.4}, accel_std={:.4}",
+                init.sample_count,
+                roll.to_degrees(),
+                pitch.to_degrees(),
+                init.gyro_bias.x,
+                init.gyro_bias.y,
+                init.gyro_bias.z,
+                init.mean_accel_norm_mps2,
+                init.accel_scale_correction,
+                init.gyro_std_radps,
+                init.accel_std_mps2,
+            );
+            imu_model.accel_scale *= init.accel_scale_correction;
+            initial_state.rot = init.rotation;
+            initial_state.bg = init.gyro_bias;
+        }
+        Err(error) => {
+            log::warn!(
+                "ESKF static init failed: {error}; assuming a level sensor with zero bias \
+                 (gravity direction errors will leak into velocity)"
+            );
+        }
+    }
+
+    // 状態の原点は IMU 原点。最初の LiDAR 原点がワールド原点に来るようにずらしておく。
+    initial_state.pos = initial_state.rot * imu_origin_in_lidar_frame;
+
+    Eskf::new(initial_state, config, imu_model, imu_origin_in_lidar_frame)
+}
+
 fn count_imu_samples_in_time_range(imu_data: &[IMU], start_time: f64, end_time: f64) -> usize {
     if !start_time.is_finite() || !end_time.is_finite() || start_time > end_time {
         return 0;
@@ -292,10 +403,13 @@ fn main() -> Result<()> {
     // <--- Loading each data --->
 
     // <--- Initialize current frame info --->
+    // current_frame_info は ESKF の状態から毎フレーム作り直す（マップ更新・色付けが参照する）。
     let mut current_frame_info = CurrentFrameInfo {
         current_global_pose: Matrix4::<f64>::identity(),
         current_velocity: Vector3::<f64>::zeros(),
     };
+    // ESKF は最初のフレーム開始時刻が分かってから初期化する。
+    let mut eskf: Option<Eskf> = None;
     // <--- Initialize current frame info --->
 
     // <--- Initialize SLAM map --->
@@ -456,27 +570,48 @@ fn main() -> Result<()> {
             prev_frame_start_time = current_frame_start_time;
         }
 
-        // <--- Predict pose by IMU --->
+        let filter = eskf.get_or_insert_with(|| {
+            let filter = initialize_eskf(
+                &imu_data,
+                imu_to_lidar,
+                imu_origin_in_lidar_frame,
+                current_frame_start_time,
+            );
+            current_frame_info.current_global_pose = filter.lidar_pose();
+            current_frame_info.current_velocity = filter.state.vel;
+            filter
+        });
+
+        // <--- Predict pose by IMU (ESKF propagation) --->
+        // 名目状態（バイアスを引いて積分）と共分散 P を前フレーム開始 → 今フレーム開始へ進め、
+        // その結果を LiDAR 反復更新の事前分布として固定する。
         let predict_pose_start = Instant::now();
-        let pose_prediction = predict_pose_by_imu(
-            &imu_data,
-            &imu_to_lidar,
-            &imu_origin_in_lidar_frame,
-            &current_frame_info.current_global_pose,
-            &current_frame_info.current_velocity,
-            prev_frame_start_time,
-            current_frame_start_time,
-        );
+        let imu_steps =
+            filter.propagate(&imu_data, prev_frame_start_time, current_frame_start_time);
+        let predicted_state = filter.state;
+        let predicted_pose = filter.lidar_pose();
+        let mut lidar_update = filter.begin_lidar_update();
+        if lidar_update.is_none() {
+            log::warn!(
+                "Frame {i}: ESKF covariance is not positive definite; LiDAR update disabled"
+            );
+        }
         let predict_pose_time = predict_pose_start.elapsed();
-        // <--- Predict pose by IMU --->
+        log::debug!(
+            "Frame {i}: ESKF propagated {imu_steps} IMU steps over {:.3} ms",
+            (current_frame_start_time - prev_frame_start_time) * 1000.0,
+        );
+        // <--- Predict pose by IMU (ESKF propagation) --->
 
         // <--- Build rotation trajectory --->
+        // deskew にも推定済みのジャイロバイアスを反映する。
         let rotation_trajectory_start = Instant::now();
         let rotation_traj = build_rotation_trajectory(
             &imu_data,
             current_frame_start_time,
             current_frame_end_time,
             &imu_to_lidar,
+            &filter.state.bg,
         );
         let rotation_trajectory_time = rotation_trajectory_start.elapsed();
         // <--- Build rotation trajectory --->
@@ -519,11 +654,15 @@ fn main() -> Result<()> {
 
         // --- ICP (Point to Plane) ---
         // IMU 予測姿勢を初期値として (R, t) を取り出す
-        let pred_pose = pose_prediction.0.cast::<f32>();
+        let pred_pose = predicted_pose.cast::<f32>();
         let pred_r: Matrix3<f32> = pred_pose.fixed_view::<3, 3>(0, 0).into();
         let pred_t: Vector3<f32> = pred_pose.fixed_view::<3, 1>(0, 3).into();
         let mut r_mat = pred_r;
         let mut t_vec = pred_t;
+        // ESKF の反復点（15次元）。ICP の (r_mat, t_vec) は常にこの状態から導出する。
+        let mut iter_state = predicted_state;
+        let mut eskf_update_applied = false;
+        let mut eskf_prior_cost: Option<f64> = None;
 
         let local_map_was_empty = slam_map.local_voxel_map.voxel_map.is_empty();
         let source_point_count = source_voxel_map.len();
@@ -547,7 +686,7 @@ fn main() -> Result<()> {
 
         if local_map_was_empty {
             log::debug!("Frame {i}: local map empty, skipping ICP");
-        } else {
+        } else if let Some(update) = lidar_update.as_mut() {
             for _iter in 0..ICP_ITERATIONS {
                 // 対応点をピックアップ
                 // - source はローカル座標、target (local_voxel_map) はワールド座標
@@ -662,15 +801,32 @@ fn main() -> Result<()> {
                     break;
                 }
 
-                let applied_delta = if recovery_iteration {
-                    retain_world_z_translation(&solve_result.delta)
+                // ESKF の反復更新: ICP の 6×6 系に IMU 予測（事前分布）を足して 15次元で解く。
+                // 上の observable solve は退化判定とログ用で、通常反復の更新量には使わない。
+                // 退化方向は事前項が予測側へ寄せるので、固有値の切り捨ては不要になる。
+                let candidate_state = if recovery_iteration {
+                    // 粗い Z 補正: ICP 単体の解のワールド Z 並進だけを使い、反復の開始点をずらす。
+                    // 予測の Z が信用できなかったことを事前分布にも反映し、
+                    // 後続の通常反復で事前項が予測の Z へ引き戻さないようにする。
+                    let dz = retain_world_z_translation(&solve_result.delta)[5] as f64;
+                    update.inflate_position_variance(2, dz.abs());
+                    let mut shifted = iter_state;
+                    shifted.pos.z += dz;
+                    shifted
                 } else {
-                    solve_result.delta
+                    let eskf_solve_start = Instant::now();
+                    let step = update.solve_step(&iter_state, &system);
+                    icp_solver_time += eskf_solve_start.elapsed();
+                    let Some(dx) = step else {
+                        log::warn!("ICP iter {_iter}: ESKF iterated update solve failed");
+                        break;
+                    };
+                    iter_state.boxplus(&dx)
                 };
+                let (candidate_r, candidate_t) = update.lidar_rt_f32(&candidate_state);
 
-                let delta_translation_m = applied_delta.fixed_rows::<3>(3).norm();
-                let delta_rotation_deg = applied_delta.fixed_rows::<3>(0).norm().to_degrees();
-                let (candidate_r, candidate_t) = apply_delta(&r_mat, &t_vec, &applied_delta);
+                let (delta_translation_m, delta_rotation_deg) =
+                    pose_correction_magnitudes(&r_mat, &t_vec, &candidate_r, &candidate_t);
                 let (total_translation_correction_m, total_rotation_correction_deg) =
                     pose_correction_magnitudes(&pred_r, &pred_t, &candidate_r, &candidate_t);
                 let max_translation_correction_m = if recovery_iteration || vertical_recovery_pose {
@@ -690,22 +846,31 @@ fn main() -> Result<()> {
                     break;
                 }
 
+                // 目的関数 = 点のロバストコスト/σ² + 事前項。両方を含めて改善を確認する。
                 let candidate_cost = compute_robust_cost(
                     &correspondences,
                     &candidate_r,
                     &candidate_t,
                     ICP_HUBER_DELTA_M,
                 );
-                if !candidate_cost.is_finite() || candidate_cost > system.cost * (1.0 + 1e-5) + 1e-8
+                let current_total_cost = update.total_cost(&iter_state, system.cost);
+                let candidate_total_cost = update.total_cost(&candidate_state, candidate_cost);
+                if !candidate_total_cost.is_finite()
+                    || candidate_total_cost > current_total_cost * (1.0 + 1e-5) + 1e-8
                 {
                     log::warn!(
-                        "ICP iter {_iter}: robust cost did not improve ({:.6} -> {:.6})",
+                        "ICP iter {_iter}: total cost did not improve ({:.6} -> {:.6}; \
+                         robust {:.6} -> {:.6})",
+                        current_total_cost,
+                        candidate_total_cost,
                         system.cost,
                         candidate_cost,
                     );
                     break;
                 }
 
+                let applied_dz = candidate_state.pos.z - iter_state.pos.z;
+                iter_state = candidate_state;
                 r_mat = candidate_r;
                 t_vec = candidate_t;
                 icp_ok = true;
@@ -714,9 +879,8 @@ fn main() -> Result<()> {
                     use_vertical_recovery_correspondences = false;
                     previous_rmse = None;
                     log::warn!(
-                        "ICP iter {_iter}: applied coarse world-Z recovery dz={:.4} m; \
+                        "ICP iter {_iter}: applied coarse world-Z recovery dz={applied_dz:.4} m; \
                          returning to normal matching for validation",
-                        applied_delta[5],
                     );
                 }
                 log::debug!(
@@ -826,13 +990,34 @@ fn main() -> Result<()> {
                     );
                     icp_ok = false;
                 }
+
+                if icp_ok {
+                    // 収束点で作り直した最終系から事後共分散を求め、ESKF に反映する。
+                    // ここで初めて filter の状態が書き換わる（失敗時は予測のまま残る）。
+                    match update.posterior_covariance(&iter_state, &final_system) {
+                        Some(posterior_cov) => {
+                            eskf_prior_cost = Some(update.prior_cost(&iter_state));
+                            filter.accept_update(iter_state, posterior_cov);
+                            eskf_update_applied = true;
+                        }
+                        None => {
+                            log::warn!(
+                                "Frame {i}: ESKF posterior covariance is not positive definite"
+                            );
+                            icp_ok = false;
+                        }
+                    }
+                }
             }
 
             if !icp_ok {
+                // ESKF は更新せず、予測状態と膨らんだ共分散のまま次フレームへ進む。
                 log::warn!("Frame {i}: ICP failed, using IMU prediction");
                 r_mat = pred_r;
                 t_vec = pred_t;
             }
+        } else {
+            log::warn!("Frame {i}: ESKF update unavailable, using IMU prediction");
         }
         let loop_end = loop_start.elapsed();
         log::debug!(
@@ -853,22 +1038,32 @@ fn main() -> Result<()> {
             .fixed_view::<3, 3>(0, 0)
             .into_owned();
 
-        let r64 = r_mat.cast::<f64>();
-        let t64 = t_vec.cast::<f64>();
-        let mut new_global_pose = Matrix4::<f64>::identity();
-        new_global_pose.fixed_view_mut::<3, 3>(0, 0).copy_from(&r64);
-        new_global_pose.fixed_view_mut::<3, 1>(0, 3).copy_from(&t64);
-
+        // 姿勢・速度は ESKF の状態から取る（更新成功時は事後推定、失敗時は IMU 予測）。
+        // 速度は位置差分ではなく推定値なので、2 m/s の頭打ちも不要になった。
+        let new_global_pose = filter.lidar_pose();
+        let r64: Matrix3<f64> = new_global_pose.fixed_view::<3, 3>(0, 0).into_owned();
         let new_pos = new_global_pose.fixed_view::<3, 1>(0, 3).into_owned();
-        let dt = (current_frame_start_time - prev_frame_start_time).max(1e-6);
-        let raw_velocity = (new_pos - prev_pos) / dt;
-        // Rejected/degenerate ICP must not feed a position jump back into the
-        // next IMU prediction. Keep the velocity predicted by the IMU instead.
-        let new_velocity = if icp_ok {
-            raw_velocity.cap_magnitude(2.0)
-        } else {
-            pose_prediction.1
-        };
+        let new_velocity = filter.state.vel;
+        let covariance_summary = filter.covariance_summary();
+        log::debug!(
+            "Frame {i}: ESKF update={}, v=[{:.3}, {:.3}, {:.3}] m/s, \
+             bg=[{:.5}, {:.5}, {:.5}] rad/s, ba=[{:.4}, {:.4}, {:.4}] m/s^2, \
+             pos_std=[{:.4}, {:.4}, {:.4}] m, prior_cost={:?}",
+            eskf_update_applied,
+            new_velocity.x,
+            new_velocity.y,
+            new_velocity.z,
+            filter.state.bg.x,
+            filter.state.bg.y,
+            filter.state.bg.z,
+            filter.state.ba.x,
+            filter.state.ba.y,
+            filter.state.ba.z,
+            covariance_summary.position_m[0],
+            covariance_summary.position_m[1],
+            covariance_summary.position_m[2],
+            eskf_prior_cost,
+        );
 
         current_frame_info.current_global_pose = new_global_pose;
         current_frame_info.current_velocity = new_velocity;
@@ -889,15 +1084,10 @@ fn main() -> Result<()> {
                     log::warn!("Frame {i}: cannot predict image pose at {:.9}", image_time,);
                     None
                 } else {
-                    let (pose, _) = predict_pose_by_imu(
-                        &imu_data,
-                        &imu_to_lidar,
-                        &imu_origin_in_lidar_frame,
-                        &current_frame_info.current_global_pose,
-                        &current_frame_info.current_velocity,
-                        current_frame_start_time,
-                        image_time,
-                    );
+                    // 共分散は触らず、名目状態（バイアス補正済み）だけを画像時刻まで進める。
+                    let image_state =
+                        filter.predict_nominal(&imu_data, current_frame_start_time, image_time);
+                    let pose = filter.lidar_pose_of(&image_state);
 
                     log::info!(
                         "Frame {i}: image pose dt={:.3} ms, \
@@ -1248,6 +1438,16 @@ fn main() -> Result<()> {
             pose_y: new_pos.y,
             pose_z: new_pos.z,
             timing,
+            eskf_update_applied,
+            gyro_bias_radps: filter.state.bg.into(),
+            accel_bias_mps2: filter.state.ba.into(),
+            velocity_mps: new_velocity.into(),
+            attitude_std_deg: covariance_summary.attitude_deg,
+            position_std_m: covariance_summary.position_m,
+            velocity_std_mps: covariance_summary.velocity_mps,
+            gyro_bias_std_radps: covariance_summary.gyro_bias_radps,
+            accel_bias_std_mps2: covariance_summary.accel_bias_mps2,
+            eskf_prior_cost,
         });
     }
 
