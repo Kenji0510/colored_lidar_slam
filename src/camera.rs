@@ -181,14 +181,7 @@ impl ColorDepthMap {
 
     /// 周辺に十分手前の点があればtrue。深度がない画素は判定に使わない。
     /// zは直線距離ではなく、画像時刻のカメラ座標のZ。
-    pub fn is_occluded(
-        &self,
-        u: u32,
-        v: u32,
-        z: f64,
-        margin_m: f64,
-        radius_px: u32,
-    ) -> bool {
+    pub fn is_occluded(&self, u: u32, v: u32, z: f64, margin_m: f64, radius_px: u32) -> bool {
         assert!(margin_m.is_finite() && margin_m >= 0.0);
 
         if u >= self.width || v >= self.height || !z.is_finite() || z <= 0.0 {
@@ -211,4 +204,56 @@ impl ColorDepthMap {
 
         false
     }
+}
+
+/// 着色に使用する中央75%の範囲で、Laplacianの分散を計算する。
+/// 値が大きいほど、輪郭が鮮明な傾向がある。
+pub fn color_image_sharpness(rgb_image: &image::RgbImage) -> f64 {
+    if rgb_image.width() == 0 || rgb_image.height() == 0 {
+        return 0.0;
+    }
+
+    // 1920×1200と960×600で比較条件を揃える。
+    // 判定用画像だけ縮小し、着色用の元画像はそのまま使う。
+    let resized =
+        image::imageops::resize(rgb_image, 960, 600, image::imageops::FilterType::Triangle);
+
+    let gray = image::DynamicImage::ImageRgb8(resized).to_luma8();
+    let (width, height) = gray.dimensions();
+
+    // 既存の着色範囲と同じ、縦横それぞれ中央75%。
+    let margin_ratio = (1.0 - COLOR_IMAGE_KEEP_RATIO) * 0.5;
+    let margin_x = (width as f64 * margin_ratio).ceil() as u32;
+    let margin_y = (height as f64 * margin_ratio).ceil() as u32;
+
+    // Laplacianが上下左右を参照するので、さらに1画素内側を使う。
+    let start_x = margin_x + 1;
+    let end_x = width - margin_x - 1;
+    let start_y = margin_y + 1;
+    let end_y = height - margin_y - 1;
+
+    let mut count = 0.0_f64;
+    let mut mean = 0.0_f64;
+    let mut m2 = 0.0_f64;
+
+    for y in start_y..end_y {
+        for x in start_x..end_x {
+            let center = gray.get_pixel(x, y).0[0] as f64;
+            let left = gray.get_pixel(x - 1, y).0[0] as f64;
+            let right = gray.get_pixel(x + 1, y).0[0] as f64;
+            let up = gray.get_pixel(x, y - 1).0[0] as f64;
+            let down = gray.get_pixel(x, y + 1).0[0] as f64;
+
+            // 上下左右と中心画素からLaplacianを計算する。
+            let laplacian = left + right + up + down - 4.0 * center;
+
+            // Welford法で分散を集計する。
+            count += 1.0;
+            let delta = laplacian - mean;
+            mean += delta / count;
+            m2 += delta * (laplacian - mean);
+        }
+    }
+
+    if count > 0.0 { m2 / count } else { 0.0 }
 }

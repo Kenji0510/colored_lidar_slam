@@ -2,7 +2,8 @@ use anyhow::{Result, bail};
 use nalgebra::{Matrix3, Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
 use re_lidar_slam::{
     camera::{
-        CameraIntrinsics, ColorDepthMap, build_camera_from_lidar, colorize_world_points, project_camera_point,
+        CameraIntrinsics, ColorDepthMap, build_camera_from_lidar, color_image_sharpness,
+        colorize_world_points, project_camera_point,
     },
     deskew_points::deskew_points,
     eskf::{
@@ -268,6 +269,8 @@ const STATIC_INIT_MIN_SAMPLES: usize = 50;
 const STATIC_INIT_MAX_GYRO_STD_RADPS: f64 = 0.02;
 const STATIC_INIT_MAX_ACCEL_STD_MPS2: f64 = 0.15;
 const STATIC_INIT_NORMALIZE_ACCEL_MAGNITUDE: bool = true;
+
+const COLOR_MIN_LAPLACIAN_VARIANCE: f64 = 80.0;
 
 fn make_eskf_config() -> EskfConfig {
     EskfConfig {
@@ -541,16 +544,27 @@ fn main() -> Result<()> {
 
             let rgb_image = load_rgb_image(&image_path)?;
 
+            let sharpness = color_image_sharpness(&rgb_image);
+            let use_for_coloring = sharpness >= COLOR_MIN_LAPLACIAN_VARIANCE;
+
             log::info!(
-                "Frame {i}: loaded RGB image {}x{} \
-             (metadata {}x{})",
+                "Frame {i}: image={} size={}x{} sharpness={:.2} \
+             threshold={:.2} use_for_coloring={}",
+                image_path.display(),
                 rgb_image.width(),
                 rgb_image.height(),
-                metadata.width,
-                metadata.height,
+                sharpness,
+                COLOR_MIN_LAPLACIAN_VARIANCE,
+                use_for_coloring,
             );
 
-            Some(rgb_image)
+            if use_for_coloring {
+                Some(rgb_image)
+            } else {
+                log::info!("Frame {i}: coloring skipped: image sharpness is too low");
+
+                None
+            }
         } else {
             None
         };
@@ -1122,58 +1136,58 @@ fn main() -> Result<()> {
         let coloring_image_pose_time = coloring_image_pose_start.elapsed();
 
         let coloring_projection_start = Instant::now();
-        let (projected_pixels, color_depth_map) = if let (Some(rgb_image), Some(camera_from_world)) = (
-            selected_rgb_image.as_ref(),
-            camera_from_world_at_image.as_ref(),
-        ) {
-            let intrinsics =
-                CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
+        let (projected_pixels, color_depth_map) =
+            if let (Some(rgb_image), Some(camera_from_world)) = (
+                selected_rgb_image.as_ref(),
+                camera_from_world_at_image.as_ref(),
+            ) {
+                let intrinsics =
+                    CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
 
-            // 点群と深度画像を、同じ画像撮影時刻のカメラ座標へ揃える。
-            let camera_from_lidar_start =
-                camera_from_world * current_frame_info.current_global_pose;
+                // 点群と深度画像を、同じ画像撮影時刻のカメラ座標へ揃える。
+                let camera_from_lidar_start =
+                    camera_from_world * current_frame_info.current_global_pose;
 
-            // 平面フィルター・間引き前の点群から作る。
-            let depth_map = ColorDepthMap::build(
-                &deskewed_points,
-                &camera_from_lidar_start,
-                &intrinsics,
-            );
+                // 平面フィルター・間引き前の点群から作る。
+                let depth_map =
+                    ColorDepthMap::build(&deskewed_points, &camera_from_lidar_start, &intrinsics);
 
-            let mut occluded_count = 0usize;
-            let pixels: Vec<Option<(u32, u32)>> = deskewed_points
-                .iter()
-                .map(|point| {
-                    let camera_point =
-                        camera_from_lidar_start.transform_point(&point.cast::<f64>());
-                    let (u, v) = project_camera_point(&camera_point, &intrinsics)?;
+                let mut occluded_count = 0usize;
+                let pixels: Vec<Option<(u32, u32)>> = deskewed_points
+                    .iter()
+                    .map(|point| {
+                        let camera_point =
+                            camera_from_lidar_start.transform_point(&point.cast::<f64>());
+                        let (u, v) = project_camera_point(&camera_point, &intrinsics)?;
 
-                    if depth_map.is_occluded(
-                        u, v, camera_point.z,
-                        COLOR_OCCLUSION_MARGIN_M,
-                        COLOR_OCCLUSION_RADIUS_PX,
-                    ) {
-                        occluded_count += 1;
-                        return None;
-                    }
+                        if depth_map.is_occluded(
+                            u,
+                            v,
+                            camera_point.z,
+                            COLOR_OCCLUSION_MARGIN_M,
+                            COLOR_OCCLUSION_RADIUS_PX,
+                        ) {
+                            occluded_count += 1;
+                            return None;
+                        }
 
-                    Some((u, v))
-                })
-                .collect();
+                        Some((u, v))
+                    })
+                    .collect();
 
-            log::info!(
-                "Frame {i}: color candidates={}/{} occluded={} image={}x{}",
-                pixels.iter().flatten().count(),
-                pixels.len(),
-                occluded_count,
-                intrinsics.width,
-                intrinsics.height,
-            );
+                log::info!(
+                    "Frame {i}: color candidates={}/{} occluded={} image={}x{}",
+                    pixels.iter().flatten().count(),
+                    pixels.len(),
+                    occluded_count,
+                    intrinsics.width,
+                    intrinsics.height,
+                );
 
-            (Some(pixels), Some(depth_map))
-        } else {
-            (None, None)
-        };
+                (Some(pixels), Some(depth_map))
+            } else {
+                (None, None)
+            };
         let coloring_projection_time = coloring_projection_start.elapsed();
 
         let coloring_colorize_start = Instant::now();
@@ -1276,7 +1290,9 @@ fn main() -> Result<()> {
                         // GlobalMap用の色にも同じ遮蔽判定を適用する。
                         if color_depth_map.as_ref().is_some_and(|depth_map| {
                             depth_map.is_occluded(
-                                u, v, camera_point.z,
+                                u,
+                                v,
+                                camera_point.z,
                                 COLOR_OCCLUSION_MARGIN_M,
                                 COLOR_OCCLUSION_RADIUS_PX,
                             )
