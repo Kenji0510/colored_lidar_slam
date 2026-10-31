@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use nalgebra::{Matrix3, Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
 use re_lidar_slam::{
     camera::{
-        CameraIntrinsics, ColorDepthMap, build_camera_from_lidar, color_image_sharpness,
+        CameraIntrinsics, ColorDepthMap, SingleImageColorReference, build_camera_from_lidar, color_image_sharpness,
         colorize_world_points, project_camera_point,
     },
     deskew_points::deskew_points,
@@ -96,8 +96,17 @@ impl LidarModel {
     }
 }
 
+#[derive(Debug)]
+struct RunOptions {
+    lidar_model: LidarModel,
+    /// PCD処理ループの0始まりインデックス。画像のframe_indexとは別。
+    recolor_frame: Option<usize>,
+    /// 選ばれた元画像上の[x_min, y_min, x_max, y_max]。
+    recolor_roi: Option<[u32; 4]>,
+}
+
 enum CommandLineAction {
-    Run(LidarModel),
+    Run(RunOptions),
     Help,
 }
 
@@ -106,6 +115,8 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut lidar_model = LidarModel::Mid70;
+    let mut recolor_frame = None;
+    let mut recolor_roi = None;
     let mut args = args.into_iter();
 
     while let Some(argument) = args.next() {
@@ -128,16 +139,72 @@ where
             _ if argument.starts_with("--lidar=") => {
                 lidar_model = LidarModel::parse(&argument["--lidar=".len()..])?;
             }
+            "--recolor-frame" => {
+                let value = next_command_line_value(&mut args, "--recolor-frame")?;
+                recolor_frame = Some(parse_recolor_frame(&value)?);
+            }
+            _ if argument.starts_with("--recolor-frame=") => {
+                recolor_frame = Some(parse_recolor_frame(&argument["--recolor-frame=".len()..])?);
+            }
+            "--recolor-roi" => {
+                let value = next_command_line_value(&mut args, "--recolor-roi")?;
+                recolor_roi = Some(parse_recolor_roi(&value)?);
+            }
+            _ if argument.starts_with("--recolor-roi=") => {
+                recolor_roi = Some(parse_recolor_roi(&argument["--recolor-roi=".len()..])?);
+            }
             _ => bail!("unknown argument '{argument}'; use --help for usage"),
         }
     }
 
-    Ok(CommandLineAction::Run(lidar_model))
+    anyhow::ensure!(
+        recolor_roi.is_none() || recolor_frame.is_some(),
+        "--recolor-roi requires --recolor-frame"
+    );
+
+    Ok(CommandLineAction::Run(RunOptions {
+        lidar_model,
+        recolor_frame,
+        recolor_roi,
+    }))
+}
+
+fn next_command_line_value(
+    args: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+) -> Result<String> {
+    args.next()
+        .ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{flag} must be valid UTF-8"))
+}
+
+fn parse_recolor_frame(value: &str) -> Result<usize> {
+    value.parse::<usize>().map_err(|_| {
+        anyhow::anyhow!("--recolor-frame must be a zero-based non-negative PCD frame index")
+    })
+}
+
+fn parse_recolor_roi(value: &str) -> Result<[u32; 4]> {
+    let coordinates: Vec<u32> = value
+        .split(',')
+        .map(|part| part.trim().parse::<u32>())
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|_| anyhow::anyhow!("--recolor-roi must be x_min,y_min,x_max,y_max"))?;
+    anyhow::ensure!(coordinates.len() == 4, "--recolor-roi needs four coordinates");
+    let roi = [coordinates[0], coordinates[1], coordinates[2], coordinates[3]];
+    anyhow::ensure!(
+        roi[0] < roi[2] && roi[1] < roi[3],
+        "--recolor-roi requires x_min < x_max and y_min < y_max"
+    );
+    Ok(roi)
 }
 
 fn print_usage() {
-    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>]");
+    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>] [--recolor-frame N] [--recolor-roi x0,y0,x1,y1]");
     println!("  --lidar  Select the point-cloud sensor (default: mid70)");
+    println!("  --recolor-frame  Save a separate final map colored from the image selected at PCD frame N (zero-based)");
+    println!("  --recolor-roi    Optional rectangle in that original image; right/bottom edges are exclusive");
 }
 
 // Mid-70 sparse-cloud preset.
@@ -384,13 +451,14 @@ fn count_imu_samples_in_time_range(imu_data: &[IMU], start_time: f64, end_time: 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
-    let lidar_model = match parse_command_line(std::env::args_os().skip(1))? {
-        CommandLineAction::Run(lidar_model) => lidar_model,
+    let run_options = match parse_command_line(std::env::args_os().skip(1))? {
+        CommandLineAction::Run(options) => options,
         CommandLineAction::Help => {
             print_usage();
             return Ok(());
         }
     };
+    let lidar_model = run_options.lidar_model;
     let load_dir = format!("{DATASET_DIR}/{}", lidar_model.input_subdir());
     let save_dir = format!("{SAVE_ROOT_DIR}/{}", lidar_model.name());
     let imu_to_lidar = lidar_model.imu_to_lidar_rotation();
@@ -405,6 +473,14 @@ fn main() -> Result<()> {
     // <--- Loading each data --->
     let pcd_dir = format!("{load_dir}/pcd");
     let pcd_files = load_pcd_files(&pcd_dir)?;
+    if let Some(frame) = run_options.recolor_frame {
+        anyhow::ensure!(
+            frame < pcd_files.len(),
+            "--recolor-frame {} is outside the {} PCD frames in this dataset",
+            frame,
+            pcd_files.len(),
+        );
+    }
 
     log::debug!(
         "Found {} PCD files in directory: {}",
@@ -494,6 +570,8 @@ fn main() -> Result<()> {
         -1.8,                          // pitch [deg]
         -2.2,                          // yaw [deg]
     );
+
+    let mut single_image_color_reference: Option<SingleImageColorReference> = None;
 
     //
     for (i, pcd_path) in pcd_files.iter().enumerate() {
@@ -1146,6 +1224,37 @@ fn main() -> Result<()> {
         if let Some(transform) = &camera_from_world_at_image {
             log::debug!("Frame {i}: camera_from_world_at_image=\n{}", transform,);
         }
+
+        // 選択した1フレームだけ、元画像・画像時刻の姿勢・深度を固定して保持する。
+        if run_options.recolor_frame == Some(i) {
+            anyhow::ensure!(
+                local_map_was_empty || icp_ok,
+                "Cannot use recolor frame {i}: ICP quality is insufficient"
+            );
+            let metadata = selected_image.ok_or_else(|| {
+                anyhow::anyhow!("Cannot use recolor frame {i}: no matching image")
+            })?;
+            let image = selected_rgb_image.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot use recolor frame {i}: image failed the sharpness gate; inspect its sharpness log"
+                )
+            })?;
+            let camera_from_world = camera_from_world_at_image.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Cannot use recolor frame {i}: image-time camera pose is unavailable")
+            })?;
+
+            single_image_color_reference = Some(SingleImageColorReference::capture(
+                image,
+                camera_from_world,
+                &current_frame_info.current_global_pose,
+                &deskewed_points,
+                run_options.recolor_roi,
+            )?);
+            log::info!(
+                "Single-image reference: PCD frame={} image={} image_time={:.9} roi={:?}",
+                i, metadata.file_name, metadata.timestamp_sec, run_options.recolor_roi,
+            );
+        }
         let coloring_image_pose_time = coloring_image_pose_start.elapsed();
 
         let coloring_projection_start = Instant::now();
@@ -1605,6 +1714,47 @@ fn main() -> Result<()> {
         );
     }
 
+    // 完成した形状の最終座標から、指定した1枚の画像のRGBだけで別PCDを作る。
+    // 過去のcell.rgbを使わず、参照画像で着色できない点はこの比較用PCDに含めない。
+    if let Some(reference) = single_image_color_reference.as_ref() {
+        let frame = run_options.recolor_frame.expect("reference has a frame index");
+        let single_image_points: Vec<PointXYZRGB> = slam_map
+            .global_voxel_map
+            .voxel_map
+            .values()
+            .filter(|cell| {
+                cell.sample_count >= min_samples
+                    && cell.observed_frames >= min_frames
+                    && cell.surface_status == SurfaceStatus::Planar
+                    && cell.mean.coords.iter().all(|value| value.is_finite())
+            })
+            .filter_map(|cell| {
+                let rgb = reference.color_for_world_point(
+                    &cell.mean,
+                    COLOR_OCCLUSION_MARGIN_M,
+                    COLOR_OCCLUSION_RADIUS_PX,
+                )?;
+                Some(PointXYZRGB::new(cell.mean, rgb))
+            })
+            .collect();
+
+        let single_image_path = format!(
+            "{}/voxel-{}_world_map_rgb_single_image_frame-{}.pcd",
+            save_dir, GLOBAL_MAP_VOXEL_SIZE, frame,
+        );
+        if single_image_points.is_empty() {
+            log::warn!(
+                "Single-image RGB export skipped: no final planar points passed projection/ROI/occlusion; check the selected frame and ROI"
+            );
+        } else {
+            save_pcd_xyzrgb(&single_image_points, &single_image_path)?;
+            log::info!(
+                "Saved single-image final map: frame={} points={} path={}",
+                frame, single_image_points.len(), single_image_path,
+            );
+        }
+    }
+
     let planar_world_map_points: Vec<Point3<f32>> = slam_map
         .global_voxel_map
         .voxel_map
@@ -1923,7 +2073,7 @@ mod tests {
 
     #[test]
     fn command_line_defaults_to_mid70() {
-        let CommandLineAction::Run(model) = parse_args(&[]).unwrap() else {
+        let CommandLineAction::Run(super::RunOptions { lidar_model: model, .. }) = parse_args(&[]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Mid70);
@@ -1931,12 +2081,12 @@ mod tests {
 
     #[test]
     fn command_line_selects_airy96() {
-        let CommandLineAction::Run(model) = parse_args(&["--lidar", "airy96"]).unwrap() else {
+        let CommandLineAction::Run(super::RunOptions { lidar_model: model, .. }) = parse_args(&["--lidar", "airy96"]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Airy96);
 
-        let CommandLineAction::Run(model) = parse_args(&["--lidar=airy"]).unwrap() else {
+        let CommandLineAction::Run(super::RunOptions { lidar_model: model, .. }) = parse_args(&["--lidar=airy"]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Airy96);
@@ -1944,14 +2094,14 @@ mod tests {
 
     #[test]
     fn command_line_selects_avia() {
-        let CommandLineAction::Run(model) = parse_args(&["--lidar", "avia"]).unwrap() else {
+        let CommandLineAction::Run(super::RunOptions { lidar_model: model, .. }) = parse_args(&["--lidar", "avia"]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Avia);
         assert_eq!(model.input_subdir(), "avia");
         assert_eq!(model.name(), "avia");
 
-        let CommandLineAction::Run(model) = parse_args(&["--lidar=livox-avia"]).unwrap() else {
+        let CommandLineAction::Run(super::RunOptions { lidar_model: model, .. }) = parse_args(&["--lidar=livox-avia"]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Avia);
@@ -1968,6 +2118,57 @@ mod tests {
                 .to_string()
                 .contains("expected 'mid70', 'airy96', or 'avia'")
         );
+    }
+
+    #[test]
+    fn command_line_recolor_defaults_are_disabled() {
+        let CommandLineAction::Run(options) = parse_args(&[]).unwrap() else {
+            panic!("expected run action");
+        };
+        assert_eq!(options.recolor_frame, None);
+        assert_eq!(options.recolor_roi, None);
+    }
+
+    #[test]
+    fn command_line_recolor_accepts_frame_zero_and_roi() {
+        let CommandLineAction::Run(options) = parse_args(&[
+            "--lidar", "avia", "--recolor-frame", "0",
+            "--recolor-roi", "120, 150,820,520",
+        ]).unwrap() else {
+            panic!("expected run action");
+        };
+        assert_eq!(options.lidar_model, LidarModel::Avia);
+        assert_eq!(options.recolor_frame, Some(0));
+        assert_eq!(options.recolor_roi, Some([120, 150, 820, 520]));
+    }
+
+    #[test]
+    fn command_line_recolor_accepts_equals_syntax() {
+        let CommandLineAction::Run(options) = parse_args(&[
+            "--recolor-roi=0,0,960,600", "--recolor-frame=42",
+        ]).unwrap() else {
+            panic!("expected run action");
+        };
+        assert_eq!(options.recolor_frame, Some(42));
+        assert_eq!(options.recolor_roi, Some([0, 0, 960, 600]));
+    }
+
+    #[test]
+    fn command_line_recolor_rejects_missing_values_and_invalid_frames() {
+        for args in [
+            vec!["--recolor-frame"], vec!["--recolor-frame", "-1"],
+            vec!["--recolor-frame", "abc"], vec!["--recolor-roi"],
+        ] {
+            assert!(parse_args(&args).is_err(), "arguments: {args:?}");
+        }
+    }
+
+    #[test]
+    fn command_line_recolor_rejects_invalid_or_unpaired_roi() {
+        assert!(parse_args(&["--recolor-roi", "0,0,100,100"]).is_err());
+        for roi in ["0,0,10", "0,0,10,10,20", "10,0,0,10", "0,5,10,5", "-1,0,10,10"] {
+            assert!(parse_args(&["--recolor-frame", "1", "--recolor-roi", roi]).is_err());
+        }
     }
 
     #[test]
