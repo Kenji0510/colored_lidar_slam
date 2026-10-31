@@ -145,3 +145,70 @@ pub fn colorize_world_points(
 
     Ok(points)
 }
+
+/// 画像撮影時のカメラ座標で、画素ごとの最小Zを保持する。
+/// COLOR_IMAGE_KEEP_RATIOと同じ投影領域を使用する。
+pub struct ColorDepthMap {
+    width: u32,
+    height: u32,
+    nearest_z: Vec<f64>,
+}
+
+impl ColorDepthMap {
+    pub fn build(
+        lidar_points: &[Point3<f32>],
+        camera_from_lidar: &Matrix4<f64>,
+        camera: &CameraIntrinsics,
+    ) -> Self {
+        let mut map = Self {
+            width: camera.width,
+            height: camera.height,
+            nearest_z: vec![f64::INFINITY; camera.width as usize * camera.height as usize],
+        };
+
+        for point in lidar_points {
+            let camera_point = camera_from_lidar.transform_point(&point.cast::<f64>());
+            let Some((u, v)) = project_camera_point(&camera_point, camera) else {
+                continue;
+            };
+
+            let index = v as usize * map.width as usize + u as usize;
+            map.nearest_z[index] = map.nearest_z[index].min(camera_point.z);
+        }
+
+        map
+    }
+
+    /// 周辺に十分手前の点があればtrue。深度がない画素は判定に使わない。
+    /// zは直線距離ではなく、画像時刻のカメラ座標のZ。
+    pub fn is_occluded(
+        &self,
+        u: u32,
+        v: u32,
+        z: f64,
+        margin_m: f64,
+        radius_px: u32,
+    ) -> bool {
+        assert!(margin_m.is_finite() && margin_m >= 0.0);
+
+        if u >= self.width || v >= self.height || !z.is_finite() || z <= 0.0 {
+            return false;
+        }
+
+        let min_u = u.saturating_sub(radius_px);
+        let max_u = u.saturating_add(radius_px).min(self.width - 1);
+        let min_v = v.saturating_sub(radius_px);
+        let max_v = v.saturating_add(radius_px).min(self.height - 1);
+
+        for y in min_v..=max_v {
+            for x in min_u..=max_u {
+                let nearest_z = self.nearest_z[y as usize * self.width as usize + x as usize];
+                if nearest_z.is_finite() && z > nearest_z + margin_m {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
