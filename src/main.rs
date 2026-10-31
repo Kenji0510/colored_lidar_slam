@@ -172,11 +172,18 @@ const IMU_TO_AVIA_TRANSLATION_Z_M: f64 = 0.02840;
 // wall/ground boundary points out of the global map.
 const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.25; // m
 const LOCAL_MAP_VOXEL_SIZE: f32 = 0.25; // m
-const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.025; // m
-// このセンサー構成では、走行全体で 1 フレームあたり約 1800 個の GlobalMap
-// voxel が増える。入力フレーム数から最終容量を先に確保し、実行途中の巨大な
-// HashMap 再配置（数百 ms のスパイク）を避ける。
-const GLOBAL_MAP_EXPECTED_NEW_VOXELS_PER_FRAME: usize = 2048;
+const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.01; // m
+// このセンサー構成では、0.025 m voxel で走行全体で 1 フレームあたり約 1800 個の
+// GlobalMap voxel が増える。点群は主に面なので、voxel 数は (0.025 / size)^2 で
+// 増えるとみなして換算する。入力フレーム数から最終容量を先に確保し、実行途中の
+// 巨大な HashMap 再配置（数百 ms のスパイク）を避ける。
+const GLOBAL_MAP_EXPECTED_NEW_VOXELS_PER_FRAME: usize = (2048.0
+    * (0.025 / GLOBAL_MAP_VOXEL_SIZE)
+    * (0.025 / GLOBAL_MAP_VOXEL_SIZE)) as usize;
+// GlobalMap の近傍探索半径を voxel サイズに依存しない物理長で指定し、voxel 数へ換算する。
+const fn global_map_radius_voxels(radius_m: f32) -> i32 {
+    (radius_m / GLOBAL_MAP_VOXEL_SIZE).ceil() as i32
+}
 
 const LOCAL_KNN_K: usize = 5;
 const GLOBAL_KNN_K: usize = 5;
@@ -194,10 +201,14 @@ const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.08;
 // during global-map insertion, while retaining sparse Mid-70 observations.
 const GLOBAL_MIN_PLANARITY: f32 = 0.10;
 
-// Global map の累積点から局所平面を確定するための遅延・5x5x5 RANSAC/PCA 設定。
+// Global map の累積点から局所平面を確定するための遅延 RANSAC/PCA 設定。
 // 成熟平面を後続フレームの挿入ゲートに使うため、従来の30フレームより早く確定する。
 const SURFACE_CLASSIFICATION_DELAY_FRAMES: u64 = 5;
-const SURFACE_NEIGHBOR_RADIUS_VOXELS: i32 = 2;
+// 近傍は中心から ±5 cm（0.025 m voxel で 5x5x5、0.01 m voxel で 11x11x11）。
+// voxel 数で固定すると細かい voxel では近傍が数 cm に縮み、LiDAR ノイズと
+// 同程度の範囲で平面判定することになって大半が NonPlanar/Unknown になる。
+const SURFACE_NEIGHBOR_RADIUS_M: f32 = 0.05;
+const SURFACE_NEIGHBOR_RADIUS_VOXELS: i32 = global_map_radius_voxels(SURFACE_NEIGHBOR_RADIUS_M);
 const SURFACE_MIN_NEIGHBORS: usize = 10;
 const SURFACE_MIN_RANSAC_INLIERS: usize = 8;
 const SURFACE_MIN_CENTER_OBSERVED_FRAMES: u64 = 2;
@@ -213,7 +224,9 @@ const SURFACE_MAX_CENTER_DISTANCE_M: f32 = 0.025;
 
 // 成熟した GlobalMap 平面に対する新規観測の更新ゲート。
 // 2 cm以内は同一面として平面へ射影し、2～10 cmは二重壁候補として保留する。
-const WORLD_UPDATE_PLANE_SEARCH_RADIUS_VOXELS: i32 = 2;
+const WORLD_UPDATE_PLANE_SEARCH_RADIUS_M: f32 = 0.05;
+const WORLD_UPDATE_PLANE_SEARCH_RADIUS_VOXELS: i32 =
+    global_map_radius_voxels(WORLD_UPDATE_PLANE_SEARCH_RADIUS_M);
 const WORLD_UPDATE_MIN_MATURE_OBSERVED_FRAMES: u64 = 3;
 const WORLD_UPDATE_ACCEPT_DISTANCE_M: f32 = 0.020;
 const WORLD_UPDATE_PENDING_DISTANCE_M: f32 = 0.10;
