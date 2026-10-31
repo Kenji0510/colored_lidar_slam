@@ -20,6 +20,7 @@ use re_lidar_slam::{
         solve_icp_delta_observable,
     },
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory},
+    regional_recolor::{RegionalRecolor, RegionalRecolorConfig, RegionalRecolorPoint},
     types::{CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap},
     voxel_map::{
         ColorObservation, LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus,
@@ -103,6 +104,9 @@ struct RunOptions {
     recolor_frame: Option<usize>,
     /// 選ばれた元画像上の[x_min, y_min, x_max, y_max]。
     recolor_roi: Option<[u32; 4]>,
+    recolor_auto: bool,
+    recolor_region_size_m: f64,
+    recolor_every: usize,
 }
 
 enum CommandLineAction {
@@ -117,6 +121,11 @@ where
     let mut lidar_model = LidarModel::Mid70;
     let mut recolor_frame = None;
     let mut recolor_roi = None;
+    let regional_defaults = RegionalRecolorConfig::default();
+    let mut recolor_auto = false;
+    let mut recolor_region_size_m = regional_defaults.region_size_m;
+    let mut recolor_every = regional_defaults.evaluate_every;
+    let mut regional_option_given = false;
     let mut args = args.into_iter();
 
     while let Some(argument) = args.next() {
@@ -153,6 +162,25 @@ where
             _ if argument.starts_with("--recolor-roi=") => {
                 recolor_roi = Some(parse_recolor_roi(&argument["--recolor-roi=".len()..])?);
             }
+            "--recolor-auto" => recolor_auto = true,
+            "--recolor-region-size" => {
+                let value = next_command_line_value(&mut args, "--recolor-region-size")?;
+                recolor_region_size_m = parse_recolor_region_size(&value)?;
+                regional_option_given = true;
+            }
+            _ if argument.starts_with("--recolor-region-size=") => {
+                recolor_region_size_m = parse_recolor_region_size(&argument["--recolor-region-size=".len()..])?;
+                regional_option_given = true;
+            }
+            "--recolor-every" => {
+                let value = next_command_line_value(&mut args, "--recolor-every")?;
+                recolor_every = parse_recolor_every(&value)?;
+                regional_option_given = true;
+            }
+            _ if argument.starts_with("--recolor-every=") => {
+                recolor_every = parse_recolor_every(&argument["--recolor-every=".len()..])?;
+                regional_option_given = true;
+            }
             _ => bail!("unknown argument '{argument}'; use --help for usage"),
         }
     }
@@ -162,10 +190,18 @@ where
         "--recolor-roi requires --recolor-frame"
     );
 
+    anyhow::ensure!(
+        !regional_option_given || recolor_auto,
+        "--recolor-region-size and --recolor-every require --recolor-auto"
+    );
+
     Ok(CommandLineAction::Run(RunOptions {
         lidar_model,
         recolor_frame,
         recolor_roi,
+        recolor_auto,
+        recolor_region_size_m,
+        recolor_every,
     }))
 }
 
@@ -200,11 +236,29 @@ fn parse_recolor_roi(value: &str) -> Result<[u32; 4]> {
     Ok(roi)
 }
 
+fn parse_recolor_region_size(value: &str) -> Result<f64> {
+    let size = value.parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("--recolor-region-size must be a positive number in meters"))?;
+    anyhow::ensure!(size.is_finite() && size > 0.0,
+        "--recolor-region-size must be finite and positive");
+    Ok(size)
+}
+
+fn parse_recolor_every(value: &str) -> Result<usize> {
+    let every = value.parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("--recolor-every must be a positive frame interval"))?;
+    anyhow::ensure!(every > 0, "--recolor-every must be greater than zero");
+    Ok(every)
+}
+
 fn print_usage() {
-    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>] [--recolor-frame N] [--recolor-roi x0,y0,x1,y1]");
+    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>] [--recolor-frame N] [--recolor-roi x0,y0,x1,y1] [--recolor-auto] [--recolor-region-size M] [--recolor-every N]");
     println!("  --lidar  Select the point-cloud sensor (default: mid70)");
     println!("  --recolor-frame  Save a separate final map colored from the image selected at PCD frame N (zero-based)");
-    println!("  --recolor-roi    Optional rectangle in that original image; right/bottom edges are exclusive");
+    println!("  --recolor-roi    Optional rectangle for --recolor-frame; right/bottom edges are exclusive");
+    println!("  --recolor-auto   Select one image per world-space surface region and recolor the completed map");
+    println!("  --recolor-region-size  Region size in meters (default: 0.5)");
+    println!("  --recolor-every        Candidate frame interval (default: 5)");
 }
 
 // Mid-70 sparse-cloud preset.
@@ -572,6 +626,25 @@ fn main() -> Result<()> {
     );
 
     let mut single_image_color_reference: Option<SingleImageColorReference> = None;
+    let mut regional_recolor = if run_options.recolor_auto {
+        let config = RegionalRecolorConfig {
+            region_size_m: run_options.recolor_region_size_m,
+            evaluate_every: run_options.recolor_every,
+            occlusion_margin_m: COLOR_OCCLUSION_MARGIN_M,
+            occlusion_radius_px: COLOR_OCCLUSION_RADIUS_PX,
+            ..Default::default()
+        };
+        let recolor = RegionalRecolor::new(
+            config,
+            std::path::Path::new(&save_dir).join("regional_recolor_cache"),
+        )?;
+        log::info!("Regional recolor: size={} m, every={} frames, cache={}",
+            run_options.recolor_region_size_m, run_options.recolor_every,
+            recolor.cache_dir().display());
+        Some(recolor)
+    } else {
+        None
+    };
 
     //
     for (i, pcd_path) in pcd_files.iter().enumerate() {
@@ -1258,6 +1331,30 @@ fn main() -> Result<()> {
         let coloring_image_pose_time = coloring_image_pose_start.elapsed();
 
         let coloring_projection_start = Instant::now();
+        // 自動再着色の候補収集。実際のRGB取得は全フレーム処理後に行う。
+        if let Some(recolor) = regional_recolor.as_mut() {
+            if recolor.should_consider_frame(i) && (local_map_was_empty || icp_ok) {
+                if let (Some(metadata), Some(image), Some(camera_from_world)) = (
+                    selected_image,
+                    selected_rgb_image.as_ref(),
+                    camera_from_world_at_image.as_ref(),
+                ) {
+                    let prepare_start = Instant::now();
+                    let image_path = std::path::Path::new(&image_meta_dir).join(&metadata.file_name);
+                    let observed = recolor.observe_frame(
+                        i, metadata.timestamp_sec, &image_path, image,
+                        camera_from_world,
+                        &current_frame_info.current_global_pose,
+                        &deskewed_points,
+                    )?;
+                    log::info!(
+                        "Regional candidates: frame={} regions={} retained={} cached={} elapsed={:.2?}",
+                        i, observed.visible_regions, observed.retained_candidates,
+                        observed.cached, prepare_start.elapsed(),
+                    );
+                }
+            }
+        }
         let (projected_pixels, color_depth_map) =
             if let (Some(rgb_image), Some(camera_from_world)) = (
                 selected_rgb_image.as_ref(),
@@ -1714,6 +1811,9 @@ fn main() -> Result<()> {
         );
     }
 
+    // 通常RGBの保存が終わったので、広域再着色の前に一時メモリを解放する。
+    drop(planar_world_map_rgb);
+
     // 完成した形状の最終座標から、指定した1枚の画像のRGBだけで別PCDを作る。
     // 過去のcell.rgbを使わず、参照画像で着色できない点はこの比較用PCDに含めない。
     if let Some(reference) = single_image_color_reference.as_ref() {
@@ -1753,6 +1853,47 @@ fn main() -> Result<()> {
                 frame, single_image_points.len(), single_image_path,
             );
         }
+    }
+
+    // 領域単位で画像を選び、完成後のcell.meanへRGBを付与する。
+    if let Some(recolor) = regional_recolor.as_ref() {
+        let regional_start = Instant::now();
+        let points: Vec<RegionalRecolorPoint> = slam_map
+            .global_voxel_map.voxel_map.values()
+            .filter(|cell| {
+                cell.sample_count >= min_samples
+                    && cell.observed_frames >= min_frames
+                    && cell.surface_status == SurfaceStatus::Planar
+                    && cell.mean.coords.iter().all(|value| value.is_finite())
+            })
+            .map(|cell| RegionalRecolorPoint {
+                position: cell.mean,
+                normal: cell.surface_plane.as_ref().map(|plane| plane.normal),
+            })
+            .collect();
+        // 通常の処理と同じ画像ローダーを使い、画像の向き・形式を揃える。
+        let result = recolor.recolor_points(&points, |path| Ok(load_rgb_image(&path.to_path_buf())?))?;
+        let colored: Vec<PointXYZRGB> = points.iter().zip(&result.colors)
+            .filter_map(|(point, rgb)| rgb.map(|rgb| PointXYZRGB::new(point.position, rgb)))
+            .collect();
+        let output_path = format!("{}/voxel-{}_world_map_rgb_regional.pcd",
+            save_dir, GLOBAL_MAP_VOXEL_SIZE);
+        if colored.is_empty() {
+            log::warn!("Regional RGB export skipped: no valid reference views; inspect the report and image/pose/quality logs");
+        } else {
+            save_pcd_xyzrgb(&colored, &output_path)?;
+        }
+        let report_path = std::path::Path::new(&save_dir).join("regional_recolor_report.json");
+        recolor.write_report(&report_path, &result)?;
+        log::info!(
+            "Regional recolor: input={} colored={} uncolored={} patches={} selected={} no_candidates={} no_usable_view={} unknown_depth={} scoring_images={} coloring_images={} elapsed={:.2?} output={} report={}",
+            points.len(), result.stats.colored_points, result.stats.uncolored_points,
+            result.stats.surface_patches, result.stats.selected_patches,
+            result.stats.patches_without_candidates, result.stats.patches_without_usable_view,
+            result.stats.unknown_depth_colored_points,
+            result.stats.images_loaded_for_scoring, result.stats.images_loaded_for_coloring,
+            regional_start.elapsed(), output_path, report_path.display(),
+        );
     }
 
     let planar_world_map_points: Vec<Point3<f32>> = slam_map
@@ -2169,6 +2310,56 @@ mod tests {
         for roi in ["0,0,10", "0,0,10,10,20", "10,0,0,10", "0,5,10,5", "-1,0,10,10"] {
             assert!(parse_args(&["--recolor-frame", "1", "--recolor-roi", roi]).is_err());
         }
+    }
+
+    #[test]
+    fn command_line_regional_defaults_and_auto_mode() {
+        let CommandLineAction::Run(disabled) = parse_args(&[]).unwrap() else { panic!() };
+        assert!(!disabled.recolor_auto);
+        let CommandLineAction::Run(options) = parse_args(&["--recolor-auto"]).unwrap() else { panic!() };
+        assert!(options.recolor_auto);
+        assert_eq!(options.recolor_region_size_m, 0.5);
+        assert_eq!(options.recolor_every, 5);
+    }
+
+    #[test]
+    fn command_line_regional_accepts_tuning_and_equals_syntax() {
+        for args in [
+            vec!["--recolor-auto", "--recolor-region-size", "0.75", "--recolor-every", "2"],
+            vec!["--recolor-region-size=0.75", "--recolor-every=2", "--recolor-auto"],
+        ] {
+            let CommandLineAction::Run(options) = parse_args(&args).unwrap() else { panic!() };
+            assert_eq!(options.recolor_region_size_m, 0.75);
+            assert_eq!(options.recolor_every, 2);
+        }
+    }
+
+    #[test]
+    fn command_line_regional_can_run_alongside_single_image_comparison() {
+        let CommandLineAction::Run(options) = parse_args(&[
+            "--lidar", "avia", "--recolor-auto", "--recolor-frame", "300",
+            "--recolor-roi", "0,0,960,600",
+        ]).unwrap() else { panic!() };
+        assert!(options.recolor_auto);
+        assert_eq!(options.recolor_frame, Some(300));
+    }
+
+    #[test]
+    fn command_line_regional_rejects_invalid_region_sizes() {
+        for value in ["0", "-1", "NaN", "inf", "abc"] {
+            assert!(parse_args(&["--recolor-auto", "--recolor-region-size", value]).is_err());
+        }
+    }
+
+    #[test]
+    fn command_line_regional_rejects_invalid_intervals_or_missing_auto_flag() {
+        for value in ["0", "-1", "abc"] {
+            assert!(parse_args(&["--recolor-auto", "--recolor-every", value]).is_err());
+        }
+        assert!(parse_args(&["--recolor-every", "5"]).is_err());
+        assert!(parse_args(&["--recolor-region-size", "0.5"]).is_err());
+        assert!(parse_args(&["--recolor-auto", "--recolor-every"]).is_err());
+        assert!(parse_args(&["--recolor-auto", "--recolor-region-size"]).is_err());
     }
 
     #[test]
