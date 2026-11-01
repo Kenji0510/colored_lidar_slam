@@ -28,6 +28,14 @@ pub struct RegionalRecolorConfig {
     pub top_candidates: usize,
     pub occlusion_margin_m: f64,
     pub occlusion_radius_px: u32,
+    /// 同じ面の隣接領域で、異なる画像を使うことへのペナルティ。0で無効。
+    pub coherence_weight: f64,
+    /// 各領域の最高スコアに対し、この割合以上の候補だけを共有画像に使う。
+    pub coherence_min_quality_ratio: f64,
+    pub coherence_iterations: usize,
+    pub coherence_normal_cos: f64,
+    pub coherence_plane_distance_m: f64,
+    pub coherence_neighbor_candidates: usize,
 }
 
 impl Default for RegionalRecolorConfig {
@@ -42,6 +50,12 @@ impl Default for RegionalRecolorConfig {
             top_candidates: 3,
             occlusion_margin_m: 0.20,
             occlusion_radius_px: 2,
+            coherence_weight: 0.35,
+            coherence_min_quality_ratio: 0.6,
+            coherence_iterations: 8,
+            coherence_normal_cos: 0.95,
+            coherence_plane_distance_m: 0.05,
+            coherence_neighbor_candidates: 4,
         }
     }
 }
@@ -77,6 +91,33 @@ impl RegionalRecolorConfig {
         ensure!(
             self.occlusion_margin_m.is_finite() && self.occlusion_margin_m >= 0.0,
             "occlusion_margin_m must be finite and non-negative"
+        );
+        ensure!(
+            self.coherence_weight.is_finite() && self.coherence_weight >= 0.0,
+            "coherence_weight must be finite and non-negative"
+        );
+        ensure!(
+            self.coherence_min_quality_ratio.is_finite()
+                && self.coherence_min_quality_ratio > 0.0
+                && self.coherence_min_quality_ratio <= 1.0,
+            "coherence_min_quality_ratio must be in (0, 1]"
+        );
+        ensure!(
+            (1..=64).contains(&self.coherence_iterations),
+            "coherence_iterations must be 1..=64"
+        );
+        ensure!(
+            self.coherence_normal_cos.is_finite()
+                && (0.0..=1.0).contains(&self.coherence_normal_cos),
+            "invalid coherence_normal_cos"
+        );
+        ensure!(
+            self.coherence_plane_distance_m.is_finite() && self.coherence_plane_distance_m >= 0.0,
+            "coherence_plane_distance_m must be finite and non-negative"
+        );
+        ensure!(
+            (1..=16).contains(&self.coherence_neighbor_candidates),
+            "coherence_neighbor_candidates must be 1..=16"
         );
         Ok(())
     }
@@ -193,6 +234,13 @@ pub struct RegionalRecolorStats {
     pub unknown_depth_colored_points: usize,
     pub images_loaded_for_scoring: usize,
     pub images_loaded_for_coloring: usize,
+    pub coherence_edges: usize,
+    pub coherence_seams_before: usize,
+    pub coherence_seams_after: usize,
+    pub coherence_changed_patches: usize,
+    pub coherence_iterations: usize,
+    pub coherence_energy_before: f64,
+    pub coherence_energy_after: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -407,15 +455,34 @@ impl RegionalRecolor {
             }
         }
         let patches: Vec<_> = patches.into_iter().collect();
+        let adjacency = surface_adjacency(&patches, points, &self.config);
         let mut stats = RegionalRecolorStats {
             evaluated_frames: self.seen_frames.len(),
             cached_frames: self.frames.len(),
             surface_patches: patches.len(),
             ..Default::default()
         };
+        let initial_ids: Vec<_> = patches
+            .iter()
+            .map(|(key, _)| self.candidate_frame_ids(*key))
+            .collect();
         let mut by_frame: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for (patch_index, (key, _)) in patches.iter().enumerate() {
-            let ids = self.candidate_frame_ids(*key);
+        for patch_index in 0..patches.len() {
+            let mut ids = initial_ids[patch_index].clone();
+            if self.config.coherence_weight > 0.0 {
+                for &neighbor in &adjacency[patch_index] {
+                    // 共通画像を選べるように候補を共有する。採用前には自身の点で
+                    // カバー率・法線・遮蔽を再評価し、隣の評価値を流用しない。
+                    ids.extend(
+                        initial_ids[neighbor]
+                            .iter()
+                            .copied()
+                            .take(self.config.coherence_neighbor_candidates),
+                    );
+                }
+                ids.sort_unstable();
+                ids.dedup();
+            }
             if ids.is_empty() {
                 stats.patches_without_candidates += 1;
             }
@@ -424,7 +491,7 @@ impl RegionalRecolor {
             }
         }
 
-        let mut winners: Vec<Option<PatchSelection>> = vec![None; patches.len()];
+        let mut options: Vec<Vec<PatchSelection>> = vec![Vec::new(); patches.len()];
         let scoring_total = by_frame.len();
         for (step, (frame_id, patch_indices)) in by_frame.into_iter().enumerate() {
             if step % 25 == 0 || step + 1 == scoring_total {
@@ -476,24 +543,48 @@ impl RegionalRecolor {
                 if !score.is_finite() || score <= 0.0 {
                     continue;
                 }
-                if winners[patch_index].as_ref().map_or(true, |old| {
-                    score > old.score || (score == old.score && frame.frame_index < old.frame_index)
-                }) {
-                    winners[patch_index] = Some(PatchSelection {
-                        key: *key,
-                        frame_id,
-                        frame_index: frame.frame_index,
-                        score,
-                        coverage,
-                        sharpness: local_sharpness,
-                        mean_distance_m: distance,
-                        mean_front_cos: front_cos,
-                        point_count: indices.len(),
-                        colored_count: 0,
-                    });
-                }
+                options[patch_index].push(PatchSelection {
+                    key: *key,
+                    frame_id,
+                    frame_index: frame.frame_index,
+                    score,
+                    coverage,
+                    sharpness: local_sharpness,
+                    mean_distance_m: distance,
+                    mean_front_cos: front_cos,
+                    point_count: indices.len(),
+                    colored_count: 0,
+                });
+                // 最大スコアは単調に増えるので、今後も品質下限に戻れない候補は捨てる。
+                let best = options[patch_index]
+                    .iter()
+                    .map(|view| view.score)
+                    .fold(0.0_f64, f64::max);
+                let ratio = if self.config.coherence_weight > 0.0 {
+                    self.config.coherence_min_quality_ratio
+                } else {
+                    1.0
+                };
+                options[patch_index].retain(|view| view.score >= best * ratio);
             }
         }
+
+        let (mut winners, coherence) = select_coherent_views(options, &adjacency, &self.config);
+        stats.coherence_edges = coherence.edges;
+        stats.coherence_seams_before = coherence.seams_before;
+        stats.coherence_seams_after = coherence.seams_after;
+        stats.coherence_changed_patches = coherence.changed;
+        stats.coherence_iterations = coherence.iterations;
+        stats.coherence_energy_before = coherence.energy_before;
+        stats.coherence_energy_after = coherence.energy_after;
+        log::info!(
+            "Regional coherence: seams={} -> {}, changed={}, energy={:.3} -> {:.3}",
+            coherence.seams_before,
+            coherence.seams_after,
+            coherence.changed,
+            coherence.energy_before,
+            coherence.energy_after
+        );
 
         let mut selected_by_frame: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (patch_index, winner) in winners.iter().enumerate() {
@@ -687,6 +778,334 @@ impl RegionalRecolor {
         writer.flush()?;
         Ok(())
     }
+}
+
+struct PatchGeometry {
+    center: Point3<f64>,
+    normal: Vector3<f64>,
+}
+
+/// 空間的に隣接し、法線と面からの距離も整合する領域だけを接続する。
+fn surface_adjacency(
+    patches: &[(SurfacePatchKey, Vec<usize>)],
+    points: &[RegionalRecolorPoint],
+    config: &RegionalRecolorConfig,
+) -> Vec<Vec<usize>> {
+    let geometry: Vec<Option<PatchGeometry>> = patches
+        .iter()
+        .map(|(_, indices)| {
+            let mut position_sum = Vector3::zeros();
+            let mut normal_sum = Vector3::<f64>::zeros();
+            for &index in indices {
+                position_sum += points[index].position.cast::<f64>().coords;
+                if let Some(mut normal) = unit_normal(points[index].normal.as_ref()) {
+                    if normal.dot(&normal_sum) < 0.0 {
+                        normal = -normal;
+                    }
+                    normal_sum += normal;
+                }
+            }
+            let length = normal_sum.norm();
+            if indices.is_empty() || !length.is_finite() || length < 1e-6 {
+                return None;
+            }
+            Some(PatchGeometry {
+                center: Point3::from(position_sum / indices.len() as f64),
+                normal: normal_sum / length,
+            })
+        })
+        .collect();
+    let mut by_region: HashMap<[i64; 3], Vec<usize>> = HashMap::new();
+    for (index, (key, _)) in patches.iter().enumerate() {
+        by_region.entry(key.region).or_default().push(index);
+    }
+    let mut adjacency = vec![Vec::new(); patches.len()];
+    let offsets = [
+        [0, 0, 0],
+        [-1, 0, 0],
+        [1, 0, 0],
+        [0, -1, 0],
+        [0, 1, 0],
+        [0, 0, -1],
+        [0, 0, 1],
+    ];
+    for (index, (key, _)) in patches.iter().enumerate() {
+        let Some(a) = &geometry[index] else {
+            continue;
+        };
+        for offset in offsets {
+            let (Some(x), Some(y), Some(z)) = (
+                key.region[0].checked_add(offset[0]),
+                key.region[1].checked_add(offset[1]),
+                key.region[2].checked_add(offset[2]),
+            ) else {
+                continue;
+            };
+            let Some(neighbors) = by_region.get(&[x, y, z]) else {
+                continue;
+            };
+            for &other in neighbors {
+                if other <= index {
+                    continue;
+                }
+                let Some(b) = &geometry[other] else {
+                    continue;
+                };
+                let delta = b.center - a.center;
+                if a.normal.dot(&b.normal).abs() >= config.coherence_normal_cos
+                    && a.normal.dot(&delta).abs() <= config.coherence_plane_distance_m
+                    && b.normal.dot(&delta).abs() <= config.coherence_plane_distance_m
+                {
+                    adjacency[index].push(other);
+                    adjacency[other].push(index);
+                }
+            }
+        }
+    }
+    for neighbors in &mut adjacency {
+        neighbors.sort_unstable();
+        neighbors.dedup();
+    }
+    adjacency
+}
+
+#[derive(Default)]
+struct CoherenceStats {
+    edges: usize,
+    seams_before: usize,
+    seams_after: usize,
+    changed: usize,
+    iterations: usize,
+    energy_before: f64,
+    energy_after: f64,
+}
+
+fn view_frame(
+    node: usize,
+    labels: &[Option<usize>],
+    options: &[Vec<PatchSelection>],
+) -> Option<usize> {
+    labels[node].map(|index| options[node][index].frame_id)
+}
+
+fn view_cost(node: usize, option: usize, options: &[Vec<PatchSelection>]) -> f64 {
+    // optionsはスコア降順。最高品質からどれだけ下がるかを無次元のコストにする。
+    (options[node][0].score / options[node][option].score)
+        .ln()
+        .max(0.0)
+}
+
+fn seam_count(
+    labels: &[Option<usize>],
+    options: &[Vec<PatchSelection>],
+    adjacency: &[Vec<usize>],
+) -> usize {
+    let mut count = 0;
+    for (node, neighbors) in adjacency.iter().enumerate() {
+        let Some(frame) = view_frame(node, labels, options) else {
+            continue;
+        };
+        for &other in neighbors {
+            if other > node && view_frame(other, labels, options).is_some_and(|id| id != frame) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn coherence_energy(
+    labels: &[Option<usize>],
+    options: &[Vec<PatchSelection>],
+    adjacency: &[Vec<usize>],
+    weight: f64,
+) -> f64 {
+    let data: f64 = labels
+        .iter()
+        .enumerate()
+        .filter_map(|(node, label)| label.map(|option| view_cost(node, option, options)))
+        .sum();
+    data + weight * seam_count(labels, options, adjacency) as f64
+}
+
+/// 画素色を混ぜず、画像IDの選び方を揃える。
+/// 単点の座標降下に加え、連結した領域全体の共通画像への切替も試す。
+/// 各切替は「品質低下コスト + 異画像境界コスト」が減る場合だけ採用する。
+fn select_coherent_views(
+    mut options: Vec<Vec<PatchSelection>>,
+    adjacency: &[Vec<usize>],
+    config: &RegionalRecolorConfig,
+) -> (Vec<Option<PatchSelection>>, CoherenceStats) {
+    debug_assert_eq!(options.len(), adjacency.len());
+    for views in &mut options {
+        views.retain(|view| {
+            view.score.is_finite()
+                && view.score > 0.0
+                && view.coverage >= config.min_visible_fraction
+        });
+        views.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.frame_index.cmp(&b.frame_index))
+                .then_with(|| a.frame_id.cmp(&b.frame_id))
+        });
+        if let Some(best) = views.first() {
+            let ratio = if config.coherence_weight > 0.0 {
+                config.coherence_min_quality_ratio
+            } else {
+                1.0
+            };
+            let minimum = best.score * ratio;
+            views.retain(|view| view.score >= minimum);
+        }
+    }
+    let mut labels: Vec<Option<usize>> = options
+        .iter()
+        .map(|views| if views.is_empty() { None } else { Some(0) })
+        .collect();
+    let initial_frames: Vec<_> = (0..labels.len())
+        .map(|node| view_frame(node, &labels, &options))
+        .collect();
+    let mut stats = CoherenceStats {
+        edges: adjacency.iter().map(Vec::len).sum::<usize>() / 2,
+        seams_before: seam_count(&labels, &options, adjacency),
+        energy_before: coherence_energy(&labels, &options, adjacency, config.coherence_weight),
+        ..Default::default()
+    };
+
+    // 画像ごとに、その画像を品質・カバー率条件を守って使える領域をまとめる。
+    let mut by_frame: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+    for (node, views) in options.iter().enumerate() {
+        for (option, view) in views.iter().enumerate() {
+            by_frame
+                .entry(view.frame_id)
+                .or_default()
+                .push((node, option));
+        }
+    }
+    let mut moves: Vec<_> = by_frame
+        .into_iter()
+        .map(|(frame, entries)| {
+            let lookup: HashMap<_, _> = entries.iter().copied().collect();
+            (frame, entries, lookup)
+        })
+        .collect();
+    // 大きな連続領域を覆う画像から試す。順序は再現可能に固定する。
+    moves.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+
+    if config.coherence_weight > 0.0 {
+        for iteration in 0..config.coherence_iterations {
+            let mut changed = false;
+            // 近傍に合わせた、領域単位の改善。
+            for step in 0..labels.len() {
+                let node = if iteration % 2 == 0 {
+                    step
+                } else {
+                    labels.len() - 1 - step
+                };
+                let Some(current) = labels[node] else {
+                    continue;
+                };
+                let local_cost = |option: usize| {
+                    let frame = options[node][option].frame_id;
+                    view_cost(node, option, &options)
+                        + config.coherence_weight
+                            * adjacency[node]
+                                .iter()
+                                .filter(|&&other| {
+                                    view_frame(other, &labels, &options)
+                                        .is_some_and(|id| id != frame)
+                                })
+                                .count() as f64
+                };
+                let mut best = current;
+                let mut best_cost = local_cost(current);
+                for option in 0..options[node].len() {
+                    let cost = local_cost(option);
+                    if cost < best_cost - 1e-12 {
+                        best = option;
+                        best_cost = cost;
+                    }
+                }
+                if best != current {
+                    labels[node] = Some(best);
+                    changed = true;
+                }
+            }
+
+            // 1領域ずつでは動けない、大きな矩形同士の継ぎ目も減らす。
+            for (frame, entries, lookup) in &moves {
+                let mut visited = HashSet::new();
+                for &(start, _) in entries {
+                    if !visited.insert(start) {
+                        continue;
+                    }
+                    let mut component = Vec::new();
+                    let mut stack = vec![start];
+                    while let Some(node) = stack.pop() {
+                        component.push(node);
+                        for &other in &adjacency[node] {
+                            if lookup.contains_key(&other) && visited.insert(other) {
+                                stack.push(other);
+                            }
+                        }
+                    }
+                    if component
+                        .iter()
+                        .all(|&node| view_frame(node, &labels, &options) == Some(*frame))
+                    {
+                        continue;
+                    }
+                    let members: HashSet<_> = component.iter().copied().collect();
+                    let mut delta = 0.0;
+                    for &node in &component {
+                        let current = labels[node].expect("eligible node has a label");
+                        let target = lookup[&node];
+                        delta +=
+                            view_cost(node, target, &options) - view_cost(node, current, &options);
+                        let old_frame = options[node][current].frame_id;
+                        for &other in &adjacency[node] {
+                            let Some(other_frame) = view_frame(other, &labels, &options) else {
+                                continue;
+                            };
+                            if members.contains(&other) {
+                                if node < other && old_frame != other_frame {
+                                    delta -= config.coherence_weight;
+                                }
+                            } else {
+                                delta += config.coherence_weight
+                                    * ((*frame != other_frame) as u8 as f64
+                                        - (old_frame != other_frame) as u8 as f64);
+                            }
+                        }
+                    }
+                    if delta < -1e-12 {
+                        for &node in &component {
+                            labels[node] = Some(lookup[&node]);
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            stats.iterations = iteration + 1;
+            if !changed {
+                break;
+            }
+        }
+    }
+    stats.seams_after = seam_count(&labels, &options, adjacency);
+    stats.energy_after = coherence_energy(&labels, &options, adjacency, config.coherence_weight);
+    stats.changed = initial_frames
+        .iter()
+        .enumerate()
+        .filter(|&(node, frame)| *frame != view_frame(node, &labels, &options))
+        .count();
+    let winners = labels
+        .into_iter()
+        .enumerate()
+        .map(|(node, label)| label.map(|option| options[node][option].clone()))
+        .collect();
+    (winners, stats)
 }
 
 struct VisibleSample {
@@ -1050,6 +1469,239 @@ mod tests {
         assert_eq!(normal_axis(Some(&Vector3::new(1.0, 0.0, 0.0))), 0);
         assert_eq!(normal_axis(Some(&Vector3::zeros())), 3);
         assert_eq!(spatial_key(&Point3::new(f64::NAN, 0.0, 0.0), 0.5), None);
+    }
+
+    fn selection(node: usize, frame: usize, score: f64) -> PatchSelection {
+        PatchSelection {
+            key: SurfacePatchKey {
+                region: [node as i64, 0, 10],
+                normal_axis: 2,
+            },
+            frame_id: frame,
+            frame_index: frame,
+            score,
+            coverage: 1.0,
+            sharpness: 100.0,
+            mean_distance_m: 5.0,
+            mean_front_cos: 1.0,
+            point_count: 10,
+            colored_count: 0,
+        }
+    }
+
+    #[test]
+    fn adjacent_patches_prefer_one_eligible_reference_without_blending() {
+        for weight in [0.0, 0.35] {
+            let scratch = Scratch::new();
+            let mut cfg = config();
+            cfg.coherence_weight = weight;
+            let mut state = RegionalRecolor::new(cfg, &scratch.0).unwrap();
+            let a = point(0.1, 0.1, 5.1);
+            let b = point(0.6, 0.1, 5.1);
+            // 各フレームは片側の領域だけで候補登録される。
+            record(
+                &mut state,
+                0,
+                "red",
+                &image([255, 0, 0]),
+                &camera_at(0.1, 0.1, 0.0),
+                &[a],
+            );
+            record(
+                &mut state,
+                1,
+                "green",
+                &image([0, 255, 0]),
+                &camera_at(0.6, 0.1, 0.0),
+                &[b],
+            );
+            let result = state
+                .recolor_points(&[surface(a), surface(b)], |path| {
+                    Ok(image(if path == Path::new("red") {
+                        [255, 0, 0]
+                    } else {
+                        [0, 255, 0]
+                    }))
+                })
+                .unwrap();
+            assert_eq!(result.stats.coherence_edges, 1);
+            assert_eq!(result.stats.coherence_seams_before, 1);
+            if weight == 0.0 {
+                assert_eq!(result.colors, vec![Some([255, 0, 0]), Some([0, 255, 0])]);
+                assert_eq!(result.stats.coherence_seams_after, 1);
+            } else {
+                assert_eq!(result.colors[0], result.colors[1]);
+                assert!(matches!(
+                    result.colors[0],
+                    Some([255, 0, 0]) | Some([0, 255, 0])
+                ));
+                assert_eq!(result.selections[0].frame_id, result.selections[1].frame_id);
+                assert_eq!(result.stats.coherence_seams_after, 0);
+                assert_eq!(result.stats.coherence_changed_patches, 1);
+                assert!(result.stats.coherence_energy_after < result.stats.coherence_energy_before);
+            }
+        }
+    }
+
+    #[test]
+    fn component_move_removes_a_boundary_that_single_patch_moves_cannot_improve() {
+        let options = (0..4)
+            .map(|node| {
+                let preferred = usize::from(node >= 2);
+                vec![
+                    selection(node, preferred, 1.0),
+                    selection(node, 1 - preferred, 0.9),
+                ]
+            })
+            .collect();
+        let adjacency = vec![vec![1], vec![0, 2], vec![1, 3], vec![2]];
+        let (winners, stats) = select_coherent_views(options, &adjacency, &config());
+        // AA|BB: 1領域だけ切り替えると品質だけ下がり、境界数は減らない。
+        // 2領域をまとめて変えれば、品質コスト2*ln(1/0.9)<境界コスト0.35。
+        assert!(
+            winners
+                .iter()
+                .all(|winner| winner.as_ref().unwrap().frame_id == 0)
+        );
+        assert_eq!(stats.seams_before, 1);
+        assert_eq!(stats.seams_after, 0);
+        assert_eq!(stats.changed, 2);
+        assert!(stats.energy_after < stats.energy_before);
+    }
+
+    #[test]
+    fn coherence_never_forces_low_quality_or_insufficient_coverage_views() {
+        let mut poor_coverage = selection(1, 0, 1.0);
+        poor_coverage.coverage = 0.79;
+        let options = vec![
+            vec![selection(0, 0, 1.0), selection(0, 1, 0.59)],
+            vec![selection(1, 1, 1.0), poor_coverage],
+        ];
+        let mut cfg = config();
+        cfg.coherence_weight = 100.0;
+        let (winners, stats) = select_coherent_views(options, &[vec![1], vec![0]], &cfg);
+        assert_eq!(winners[0].as_ref().unwrap().frame_id, 0);
+        assert_eq!(winners[1].as_ref().unwrap().frame_id, 1);
+        assert_eq!(stats.seams_after, 1);
+        assert_eq!(stats.changed, 0);
+    }
+
+    #[test]
+    fn adjacency_connects_coplanar_opposite_sign_normals_but_not_floor_or_offset_planes() {
+        let mut points = vec![
+            surface(point(0.1, 0.1, 5.1)),
+            surface(point(0.6, 0.1, 5.1)),
+            surface(point(0.1, 0.1, 5.1)),
+            surface(point(0.1, 0.6, 5.3)),
+            surface(point(0.1, 0.6, 5.1)),
+        ];
+        points[1].normal = Some(-Vector3::z());
+        points[2].normal = Some(Vector3::y());
+        points[4].normal = None;
+        let patches = vec![
+            (
+                SurfacePatchKey {
+                    region: [0, 0, 10],
+                    normal_axis: 2,
+                },
+                vec![0],
+            ),
+            (
+                SurfacePatchKey {
+                    region: [1, 0, 10],
+                    normal_axis: 2,
+                },
+                vec![1],
+            ),
+            (
+                SurfacePatchKey {
+                    region: [0, 0, 10],
+                    normal_axis: 1,
+                },
+                vec![2],
+            ),
+            (
+                SurfacePatchKey {
+                    region: [0, 1, 10],
+                    normal_axis: 2,
+                },
+                vec![3],
+            ),
+            (
+                SurfacePatchKey {
+                    region: [0, 1, 10],
+                    normal_axis: 3,
+                },
+                vec![4],
+            ),
+        ];
+        assert_eq!(
+            surface_adjacency(&patches, &points, &config()),
+            vec![vec![1], vec![0], vec![], vec![], vec![]]
+        );
+    }
+
+    #[test]
+    fn no_reference_views_and_isolated_patches_remain_valid() {
+        let (winners, stats) = select_coherent_views(
+            vec![
+                vec![selection(0, 0, 1.0)],
+                vec![],
+                vec![selection(2, 1, 2.0)],
+            ],
+            &[vec![1], vec![0], vec![]],
+            &config(),
+        );
+        assert_eq!(winners[0].as_ref().unwrap().frame_id, 0);
+        assert!(winners[1].is_none());
+        assert_eq!(winners[2].as_ref().unwrap().frame_id, 1);
+        assert_eq!(stats.seams_before, 0);
+        assert_eq!(stats.seams_after, 0);
+        assert_eq!(stats.energy_after, 0.0);
+    }
+
+    #[test]
+    fn multi_view_grid_never_increases_total_selection_cost() {
+        let adjacency: Vec<Vec<usize>> = (0..9)
+            .map(|node| {
+                (0..9)
+                    .filter(|&other| {
+                        (node / 3 == other / 3 && (node as i32 - other as i32).abs() == 1)
+                            || (node as i32 - other as i32).abs() == 3
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut seed = 37_u64;
+        for _ in 0..32 {
+            let options: Vec<Vec<PatchSelection>> = (0..9)
+                .map(|node| {
+                    (0..3)
+                        .map(|frame| {
+                            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            selection(
+                                node,
+                                frame,
+                                0.6 + (seed >> 32) as f64 / u32::MAX as f64 * 0.4,
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            let (winners, stats) = select_coherent_views(options.clone(), &adjacency, &config());
+            let (repeat, _) = select_coherent_views(options, &adjacency, &config());
+            assert!(stats.energy_after <= stats.energy_before + 1e-10);
+            assert_eq!(
+                winners
+                    .iter()
+                    .map(|x| x.as_ref().unwrap().frame_id)
+                    .collect::<Vec<_>>(),
+                repeat
+                    .iter()
+                    .map(|x| x.as_ref().unwrap().frame_id)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
@@ -1447,6 +2099,8 @@ mod tests {
         assert_eq!(json["selections"][0]["frame_index"], 7);
         assert_eq!(json["frames"][0]["camera_from_world_column_major"][15], 1.0);
         assert_eq!(json["stats"]["colored_points"], 1);
+        assert_eq!(json["config"]["coherence_weight"], 0.35);
+        assert_eq!(json["stats"]["coherence_seams_after"], 0);
     }
 
     #[test]
@@ -1527,6 +2181,24 @@ mod tests {
         assert!(invalid.validate().is_err());
         invalid = config();
         invalid.min_visible_fraction = 1.01;
+        assert!(invalid.validate().is_err());
+        invalid = config();
+        invalid.coherence_weight = -1.0;
+        assert!(invalid.validate().is_err());
+        invalid = config();
+        invalid.coherence_min_quality_ratio = 0.0;
+        assert!(invalid.validate().is_err());
+        invalid = config();
+        invalid.coherence_iterations = 0;
+        assert!(invalid.validate().is_err());
+        invalid = config();
+        invalid.coherence_normal_cos = f64::NAN;
+        assert!(invalid.validate().is_err());
+        invalid = config();
+        invalid.coherence_plane_distance_m = -0.1;
+        assert!(invalid.validate().is_err());
+        invalid = config();
+        invalid.coherence_neighbor_candidates = 0;
         assert!(invalid.validate().is_err());
     }
 }

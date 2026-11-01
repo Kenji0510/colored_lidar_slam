@@ -33,7 +33,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/10242026/02";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/10242026/05";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
 const SAVE_ROOT_DIR: &str = "data/output/10242026";
 
@@ -107,6 +107,7 @@ struct RunOptions {
     recolor_auto: bool,
     recolor_region_size_m: f64,
     recolor_every: usize,
+    recolor_coherence_weight: f64,
 }
 
 enum CommandLineAction {
@@ -125,6 +126,7 @@ where
     let mut recolor_auto = false;
     let mut recolor_region_size_m = regional_defaults.region_size_m;
     let mut recolor_every = regional_defaults.evaluate_every;
+    let mut recolor_coherence_weight = regional_defaults.coherence_weight;
     let mut regional_option_given = false;
     let mut args = args.into_iter();
 
@@ -181,6 +183,15 @@ where
                 recolor_every = parse_recolor_every(&argument["--recolor-every=".len()..])?;
                 regional_option_given = true;
             }
+            "--recolor-coherence-weight" => {
+                let value = next_command_line_value(&mut args, "--recolor-coherence-weight")?;
+                recolor_coherence_weight = parse_recolor_coherence_weight(&value)?;
+                regional_option_given = true;
+            }
+            _ if argument.starts_with("--recolor-coherence-weight=") => {
+                recolor_coherence_weight = parse_recolor_coherence_weight(&argument["--recolor-coherence-weight=".len()..])?;
+                regional_option_given = true;
+            }
             _ => bail!("unknown argument '{argument}'; use --help for usage"),
         }
     }
@@ -192,7 +203,7 @@ where
 
     anyhow::ensure!(
         !regional_option_given || recolor_auto,
-        "--recolor-region-size and --recolor-every require --recolor-auto"
+        "--recolor-region-size, --recolor-every and --recolor-coherence-weight require --recolor-auto"
     );
 
     Ok(CommandLineAction::Run(RunOptions {
@@ -202,6 +213,7 @@ where
         recolor_auto,
         recolor_region_size_m,
         recolor_every,
+        recolor_coherence_weight,
     }))
 }
 
@@ -251,14 +263,23 @@ fn parse_recolor_every(value: &str) -> Result<usize> {
     Ok(every)
 }
 
+fn parse_recolor_coherence_weight(value: &str) -> Result<f64> {
+    let weight = value.parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("--recolor-coherence-weight must be a non-negative number"))?;
+    anyhow::ensure!(weight.is_finite() && weight >= 0.0,
+        "--recolor-coherence-weight must be finite and non-negative");
+    Ok(weight)
+}
+
 fn print_usage() {
-    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>] [--recolor-frame N] [--recolor-roi x0,y0,x1,y1] [--recolor-auto] [--recolor-region-size M] [--recolor-every N]");
+    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>] [--recolor-frame N] [--recolor-roi x0,y0,x1,y1] [--recolor-auto] [--recolor-region-size M] [--recolor-every N] [--recolor-coherence-weight W]");
     println!("  --lidar  Select the point-cloud sensor (default: mid70)");
     println!("  --recolor-frame  Save a separate final map colored from the image selected at PCD frame N (zero-based)");
     println!("  --recolor-roi    Optional rectangle for --recolor-frame; right/bottom edges are exclusive");
     println!("  --recolor-auto   Select one image per world-space surface region and recolor the completed map");
     println!("  --recolor-region-size  Region size in meters (default: 0.5)");
     println!("  --recolor-every        Candidate frame interval (default: 5)");
+    println!("  --recolor-coherence-weight  Prefer a shared image on adjacent coplanar regions (default: 0.35; 0 disables)");
 }
 
 // Mid-70 sparse-cloud preset.
@@ -630,6 +651,7 @@ fn main() -> Result<()> {
         let config = RegionalRecolorConfig {
             region_size_m: run_options.recolor_region_size_m,
             evaluate_every: run_options.recolor_every,
+            coherence_weight: run_options.recolor_coherence_weight,
             occlusion_margin_m: COLOR_OCCLUSION_MARGIN_M,
             occlusion_radius_px: COLOR_OCCLUSION_RADIUS_PX,
             ..Default::default()
@@ -638,8 +660,9 @@ fn main() -> Result<()> {
             config,
             std::path::Path::new(&save_dir).join("regional_recolor_cache"),
         )?;
-        log::info!("Regional recolor: size={} m, every={} frames, cache={}",
+        log::info!("Regional recolor: size={} m, every={} frames, coherence={}, cache={}",
             run_options.recolor_region_size_m, run_options.recolor_every,
+            run_options.recolor_coherence_weight,
             recolor.cache_dir().display());
         Some(recolor)
     } else {
@@ -1876,14 +1899,20 @@ fn main() -> Result<()> {
         let colored: Vec<PointXYZRGB> = points.iter().zip(&result.colors)
             .filter_map(|(point, rgb)| rgb.map(|rgb| PointXYZRGB::new(point.position, rgb)))
             .collect();
-        let output_path = format!("{}/voxel-{}_world_map_rgb_regional.pcd",
-            save_dir, GLOBAL_MAP_VOXEL_SIZE);
+        let suffix = if run_options.recolor_coherence_weight > 0.0 {
+            "regional_coherent"
+        } else { "regional" };
+        let output_path = format!("{}/voxel-{}_world_map_rgb_{}.pcd",
+            save_dir, GLOBAL_MAP_VOXEL_SIZE, suffix);
         if colored.is_empty() {
             log::warn!("Regional RGB export skipped: no valid reference views; inspect the report and image/pose/quality logs");
         } else {
             save_pcd_xyzrgb(&colored, &output_path)?;
         }
-        let report_path = std::path::Path::new(&save_dir).join("regional_recolor_report.json");
+        let report_name = if run_options.recolor_coherence_weight > 0.0 {
+            "regional_recolor_coherent_report.json"
+        } else { "regional_recolor_report.json" };
+        let report_path = std::path::Path::new(&save_dir).join(report_name);
         recolor.write_report(&report_path, &result)?;
         log::info!(
             "Regional recolor: input={} colored={} uncolored={} patches={} selected={} no_candidates={} no_usable_view={} unknown_depth={} scoring_images={} coloring_images={} elapsed={:.2?} output={} report={}",
@@ -2320,6 +2349,31 @@ mod tests {
         assert!(options.recolor_auto);
         assert_eq!(options.recolor_region_size_m, 0.5);
         assert_eq!(options.recolor_every, 5);
+        assert_eq!(options.recolor_coherence_weight, 0.35);
+    }
+
+    #[test]
+    fn command_line_coherence_accepts_space_equals_and_zero() {
+        for args in [
+            vec!["--recolor-auto", "--recolor-coherence-weight", "0.6"],
+            vec!["--recolor-coherence-weight=0.6", "--recolor-auto"],
+        ] {
+            let CommandLineAction::Run(options) = parse_args(&args).unwrap() else { panic!() };
+            assert_eq!(options.recolor_coherence_weight, 0.6);
+        }
+        let CommandLineAction::Run(options) = parse_args(&[
+            "--recolor-auto", "--recolor-coherence-weight", "0",
+        ]).unwrap() else { panic!() };
+        assert_eq!(options.recolor_coherence_weight, 0.0);
+    }
+
+    #[test]
+    fn command_line_coherence_rejects_invalid_or_unpaired_values() {
+        for value in ["-1", "NaN", "inf", "abc"] {
+            assert!(parse_args(&["--recolor-auto", "--recolor-coherence-weight", value]).is_err());
+        }
+        assert!(parse_args(&["--recolor-coherence-weight", "0.35"]).is_err());
+        assert!(parse_args(&["--recolor-auto", "--recolor-coherence-weight"]).is_err());
     }
 
     #[test]
