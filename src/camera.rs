@@ -85,6 +85,24 @@ fn project_camera_point_with_keep_ratio(
     camera: &CameraIntrinsics,
     keep_ratio: f64,
 ) -> Option<(u32, u32)> {
+    let (u, v) = project_camera_point_continuous(point, camera)?;
+    let (u, v) = (u.round(), v.round());
+    let width = camera.width as f64;
+    let height = camera.height as f64;
+    let margin_ratio = (1.0 - keep_ratio) * 0.5;
+    let margin_x = width * margin_ratio;
+    let margin_y = height * margin_ratio;
+    if u < margin_x || u >= width - margin_x || v < margin_y || v >= height - margin_y {
+        return None;
+    }
+    Some((u as u32, v as u32))
+}
+
+/// 歪みを含む連続画素座標。画像範囲の判定・丸めは呼び出し側で行う。
+pub fn project_camera_point_continuous(
+    point: &Point3<f64>,
+    camera: &CameraIntrinsics,
+) -> Option<(f64, f64)> {
     // 非有限の座標と、カメラの後方・カメラ平面上の点を除外。
     if !point.coords.iter().all(|v| v.is_finite()) || point.z <= 0.0 {
         return None;
@@ -103,25 +121,39 @@ fn project_camera_point_with_keep_ratio(
 
     let yd = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
 
-    let u = (camera.fx * xd + camera.cx).round();
-    let v = (camera.fy * yd + camera.cy).round();
+    let u = camera.fx * xd + camera.cx;
+    let v = camera.fy * yd + camera.cy;
 
     if !u.is_finite() || !v.is_finite() {
         return None;
     }
 
-    let width = camera.width as f64;
-    let height = camera.height as f64;
+    Some((u, v))
+}
 
-    let margin_ratio = (1.0 - keep_ratio) * 0.5;
-    let margin_x = width * margin_ratio;
-    let margin_y = height * margin_ratio;
-
-    if u < margin_x || u >= width - margin_x || v < margin_y || v >= height - margin_y {
+/// 元画像の画素を、歪みを逆補正したカメラ光線(z=1)へ戻す。
+pub fn camera_ray_for_pixel(u: f64, v: f64, camera: &CameraIntrinsics) -> Option<Vector3<f64>> {
+    let xd = (u - camera.cx) / camera.fx;
+    let yd = (v - camera.cy) / camera.fy;
+    let (mut x, mut y) = (xd, yd);
+    let [k1, k2, p1, p2, k3] = camera.distortion;
+    for _ in 0..20 {
+        let r2 = x * x + y * y;
+        let radial = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3));
+        if !radial.is_finite() || radial.abs() < 1e-8 {
+            return None;
+        }
+        let tx = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
+        let ty = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
+        x = (xd - tx) / radial;
+        y = (yd - ty) / radial;
+    }
+    let ray = Vector3::new(x, y, 1.0);
+    let check = project_camera_point_continuous(&Point3::from(ray), camera)?;
+    if (check.0 - u).abs() > 1e-3 || (check.1 - v).abs() > 1e-3 {
         return None;
     }
-
-    Some((u as u32, v as u32))
+    Some(ray)
 }
 
 pub fn colorize_world_points(
@@ -322,8 +354,7 @@ impl SingleImageColorReference {
         deskewed_points: &[Point3<f32>],
         roi: Option<[u32; 4]>,
     ) -> anyhow::Result<Self> {
-        let intrinsics =
-            CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
+        let intrinsics = CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
 
         anyhow::ensure!(
             camera_from_world.iter().all(|value| value.is_finite())
@@ -333,8 +364,10 @@ impl SingleImageColorReference {
 
         if let Some([x_min, y_min, x_max, y_max]) = roi {
             anyhow::ensure!(
-                x_min < x_max && y_min < y_max
-                    && x_max <= intrinsics.width && y_max <= intrinsics.height,
+                x_min < x_max
+                    && y_min < y_max
+                    && x_max <= intrinsics.width
+                    && y_max <= intrinsics.height,
                 "Recolor ROI {:?} must be inside the original {}x{} image",
                 roi,
                 intrinsics.width,
@@ -344,11 +377,8 @@ impl SingleImageColorReference {
 
         // 参照フレームの全点を使う。GlobalMap用の平面フィルター前の点群であること。
         let camera_from_lidar_start = camera_from_world * world_from_lidar_start;
-        let depth_map = ColorDepthMap::build_full_image(
-            deskewed_points,
-            &camera_from_lidar_start,
-            &intrinsics,
-        );
+        let depth_map =
+            ColorDepthMap::build_full_image(deskewed_points, &camera_from_lidar_start, &intrinsics);
 
         Ok(Self {
             rgb_image: rgb_image.clone(),
@@ -379,7 +409,11 @@ impl SingleImageColorReference {
         }
 
         if self.depth_map.is_occluded(
-            u, v, camera_point.z, occlusion_margin_m, occlusion_radius_px,
+            u,
+            v,
+            camera_point.z,
+            occlusion_margin_m,
+            occlusion_radius_px,
         ) {
             return None;
         }
@@ -398,8 +432,13 @@ mod single_image_recolor_tests {
 
     fn capture(points: &[Point3<f32>], roi: Option<[u32; 4]>) -> SingleImageColorReference {
         SingleImageColorReference::capture(
-            &image(), &Matrix4::identity(), &Matrix4::identity(), points, roi,
-        ).unwrap()
+            &image(),
+            &Matrix4::identity(),
+            &Matrix4::identity(),
+            points,
+            roi,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -409,11 +448,22 @@ mod single_image_recolor_tests {
         image.put_pixel(468, 336, image::Rgb([0, 255, 0]));
         let original = Point3::new(0.0_f32, 0.0, 5.0);
         let reference = SingleImageColorReference::capture(
-            &image, &Matrix4::identity(), &Matrix4::identity(), &[original], None,
-        ).unwrap();
-        assert_eq!(reference.color_for_world_point(&original, 0.2, 0), Some([255, 0, 0]));
+            &image,
+            &Matrix4::identity(),
+            &Matrix4::identity(),
+            &[original],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reference.color_for_world_point(&original, 0.2, 0),
+            Some([255, 0, 0])
+        );
         let final_mean = Point3::new(0.03_f32, 0.0, 5.0);
-        assert_eq!(reference.color_for_world_point(&final_mean, 0.2, 0), Some([0, 255, 0]));
+        assert_eq!(
+            reference.color_for_world_point(&final_mean, 0.2, 0),
+            Some([0, 255, 0])
+        );
     }
 
     #[test]
@@ -425,9 +475,13 @@ mod single_image_recolor_tests {
         world_from_lidar[(0, 3)] = 1.0;
         image.put_pixel(464, 336, image::Rgb([1, 2, 3]));
         let reference = SingleImageColorReference::capture(
-            &image, &camera_from_world, &world_from_lidar,
-            &[Point3::new(0.0_f32, 0.0, 5.0)], None,
-        ).unwrap();
+            &image,
+            &camera_from_world,
+            &world_from_lidar,
+            &[Point3::new(0.0_f32, 0.0, 5.0)],
+            None,
+        )
+        .unwrap();
         image.put_pixel(464, 336, image::Rgb([9, 9, 9]));
         camera_from_world[(0, 3)] = 100.0;
         assert_eq!(
@@ -442,7 +496,10 @@ mod single_image_recolor_tests {
         let back = Point3::new(0.0_f32, 0.0, 8.0);
         for points in [[front, back], [back, front]] {
             let reference = capture(&points, None);
-            assert_eq!(reference.color_for_world_point(&front, 0.2, 0), Some([10, 20, 30]));
+            assert_eq!(
+                reference.color_for_world_point(&front, 0.2, 0),
+                Some([10, 20, 30])
+            );
             assert_eq!(reference.color_for_world_point(&back, 0.2, 0), None);
         }
     }
@@ -451,17 +508,16 @@ mod single_image_recolor_tests {
     fn roi_uses_inclusive_left_top_and_exclusive_right_bottom() {
         let point = Point3::new(0.0_f32, 0.0, 5.0);
         assert_eq!(
-            capture(&[point], Some([464, 336, 465, 337]))
-                .color_for_world_point(&point, 0.2, 0),
+            capture(&[point], Some([464, 336, 465, 337])).color_for_world_point(&point, 0.2, 0),
             Some([10, 20, 30]),
         );
         assert_eq!(
-            capture(&[point], Some([0, 0, 464, 600]))
-                .color_for_world_point(&point, 0.2, 0), None,
+            capture(&[point], Some([0, 0, 464, 600])).color_for_world_point(&point, 0.2, 0),
+            None,
         );
         assert_eq!(
-            capture(&[point], Some([0, 0, 960, 336]))
-                .color_for_world_point(&point, 0.2, 0), None,
+            capture(&[point], Some([0, 0, 960, 336])).color_for_world_point(&point, 0.2, 0),
+            None,
         );
     }
 
@@ -469,12 +525,19 @@ mod single_image_recolor_tests {
     fn reference_projection_and_depth_cover_the_full_image() {
         let intrinsics = CameraIntrinsics::for_image_size(960, 600).unwrap();
         let front = Point3::new(-3.2_f32, 0.0, 5.0);
-        assert_eq!(project_camera_point(&front.cast::<f64>(), &intrinsics), None);
+        assert_eq!(
+            project_camera_point(&front.cast::<f64>(), &intrinsics),
+            None
+        );
         assert!(project_camera_point_full_image(&front.cast::<f64>(), &intrinsics).is_some());
         let reference = capture(&[front], None);
-        assert_eq!(reference.color_for_world_point(&front, 0.2, 0), Some([10, 20, 30]));
         assert_eq!(
-            reference.color_for_world_point(&Point3::new(-5.12, 0.0, 8.0), 0.2, 0), None,
+            reference.color_for_world_point(&front, 0.2, 0),
+            Some([10, 20, 30])
+        );
+        assert_eq!(
+            reference.color_for_world_point(&Point3::new(-5.12, 0.0, 8.0), 0.2, 0),
+            None,
         );
     }
 
@@ -490,7 +553,8 @@ mod single_image_recolor_tests {
         }
         let camera = CameraIntrinsics::for_image_size(960, 600).unwrap();
         assert_eq!(
-            project_camera_point_full_image(&Point3::new(f64::MAX / 2.0, 0.0, 1.0), &camera), None,
+            project_camera_point_full_image(&Point3::new(f64::MAX / 2.0, 0.0, 1.0), &camera),
+            None,
         );
     }
 
@@ -508,21 +572,38 @@ mod single_image_recolor_tests {
         let foreground = Point3::new(0.009_f32, 0.0, 3.0);
         let candidate = Point3::new(0.0_f32, 0.0, 8.0);
         let reference = capture(&[foreground], None);
-        assert_eq!(reference.color_for_world_point(&candidate, 0.2, 0), Some([10, 20, 30]));
+        assert_eq!(
+            reference.color_for_world_point(&candidate, 0.2, 0),
+            Some([10, 20, 30])
+        );
         assert_eq!(reference.color_for_world_point(&candidate, 0.2, 2), None);
     }
 
     #[test]
     fn rejects_invalid_roi_and_non_finite_pose() {
         for roi in [[0, 0, 961, 600], [10, 10, 10, 20], [20, 20, 10, 30]] {
-            assert!(SingleImageColorReference::capture(
-                &image(), &Matrix4::identity(), &Matrix4::identity(), &[], Some(roi),
-            ).is_err());
+            assert!(
+                SingleImageColorReference::capture(
+                    &image(),
+                    &Matrix4::identity(),
+                    &Matrix4::identity(),
+                    &[],
+                    Some(roi),
+                )
+                .is_err()
+            );
         }
         let mut bad_pose = Matrix4::identity();
         bad_pose[(0, 3)] = f64::NAN;
-        assert!(SingleImageColorReference::capture(
-            &image(), &bad_pose, &Matrix4::identity(), &[], None,
-        ).is_err());
+        assert!(
+            SingleImageColorReference::capture(
+                &image(),
+                &bad_pose,
+                &Matrix4::identity(),
+                &[],
+                None,
+            )
+            .is_err()
+        );
     }
 }

@@ -12,3 +12,4 @@ pub mod voxel_map;
 pub mod voxelization;
 
 pub mod regional_recolor;
+pub mod patch_alignment;

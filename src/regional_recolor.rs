@@ -14,6 +14,13 @@ use std::{
 };
 
 use crate::camera::{CameraIntrinsics, project_camera_point_full_image};
+use crate::patch_alignment::{
+    AlignmentEstimate, PatchAlignmentConfig, estimate_translation, plane_patch_samples,
+    reference_texture, shifted_pixel,
+};
+
+#[path = "regional_alignment.rs"]
+mod alignment;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RegionalRecolorConfig {
@@ -36,6 +43,7 @@ pub struct RegionalRecolorConfig {
     pub coherence_normal_cos: f64,
     pub coherence_plane_distance_m: f64,
     pub coherence_neighbor_candidates: usize,
+    pub alignment: PatchAlignmentConfig,
 }
 
 impl Default for RegionalRecolorConfig {
@@ -56,12 +64,14 @@ impl Default for RegionalRecolorConfig {
             coherence_normal_cos: 0.95,
             coherence_plane_distance_m: 0.05,
             coherence_neighbor_candidates: 4,
+            alignment: PatchAlignmentConfig::default(),
         }
     }
 }
 
 impl RegionalRecolorConfig {
     pub fn validate(&self) -> Result<()> {
+        self.alignment.validate()?;
         ensure!(
             self.region_size_m.is_finite() && self.region_size_m > 0.0,
             "region_size_m must be finite and positive"
@@ -241,6 +251,24 @@ pub struct RegionalRecolorStats {
     pub coherence_iterations: usize,
     pub coherence_energy_before: f64,
     pub coherence_energy_after: f64,
+    pub alignment_groups: usize,
+    pub alignment_nonplanar_groups: usize,
+    pub alignment_attempted_pairs: usize,
+    pub alignment_accepted_pairs: usize,
+    pub alignment_shifted_points: usize,
+    pub alignment_guarded_points: usize,
+    pub images_loaded_for_alignment: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AlignmentRecord {
+    pub group_id: usize,
+    pub reference_frame_index: usize,
+    pub target_frame_index: usize,
+    pub target_patches: Vec<SurfacePatchKey>,
+    pub plane_point_world: [f64; 3],
+    pub plane_normal_world: [f64; 3],
+    pub estimate: AlignmentEstimate,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -262,6 +290,7 @@ pub struct RegionalRecolorResult {
     pub colors: Vec<Option<[u8; 3]>>,
     pub stats: RegionalRecolorStats,
     pub selections: Vec<PatchSelection>,
+    pub alignment: Vec<AlignmentRecord>,
 }
 
 pub struct RegionalRecolor {
@@ -586,6 +615,14 @@ impl RegionalRecolor {
             coherence.energy_after
         );
 
+        let (shifts, alignment) = self.alignment_shifts(
+            &patches,
+            points,
+            &adjacency,
+            &winners,
+            &mut load_image,
+            &mut stats,
+        )?;
         let mut selected_by_frame: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (patch_index, winner) in winners.iter().enumerate() {
             if let Some(winner) = winner {
@@ -621,8 +658,35 @@ impl RegionalRecolor {
                     .expect("selected patch has a winner");
                 for &index in indices {
                     if let Some(sample) = self.visible_sample(&points[index], frame, &depth) {
+                        let mut pixel = [sample.u, sample.v];
+                        let shift = shifts[patch_index];
+                        if shift != [0, 0] {
+                            let z = frame
+                                .camera_from_world
+                                .transform_point(&points[index].position.cast::<f64>())
+                                .z;
+                            let corrected =
+                                shifted_pixel(pixel, shift, image.width(), image.height());
+                            // 深度キャッシュは補正前の幾何投影座標系のまま。
+                            // 周囲に別深度がある箇所では、画素移動を適用しない。
+                            if let Some(corrected) = corrected.filter(|_| {
+                                !depth.has_depth_discontinuity(
+                                    sample.u,
+                                    sample.v,
+                                    z,
+                                    self.config.occlusion_margin_m,
+                                    self.config.alignment.max_shift_px as u32
+                                        + self.config.occlusion_radius_px,
+                                )
+                            }) {
+                                pixel = corrected;
+                                stats.alignment_shifted_points += 1;
+                            } else {
+                                stats.alignment_guarded_points += 1;
+                            }
+                        }
                         let rgb = image
-                            .get_pixel_checked(sample.u, sample.v)
+                            .get_pixel_checked(pixel[0], pixel[1])
                             .context("reference pixel is outside image")?
                             .0;
                         colors[index] = Some(rgb);
@@ -640,10 +704,18 @@ impl RegionalRecolor {
         stats.patches_without_usable_view =
             patches.len() - stats.patches_without_candidates - selections.len();
         stats.uncolored_points = points.len() - stats.colored_points;
+        if self.config.alignment.enabled {
+            log::info!(
+                "Regional alignment: shifted_points={} guarded_points={}",
+                stats.alignment_shifted_points,
+                stats.alignment_guarded_points
+            );
+        }
         Ok(RegionalRecolorResult {
             colors,
             stats,
             selections,
+            alignment,
         })
     }
 
@@ -766,12 +838,14 @@ impl RegionalRecolor {
             stats: &'a RegionalRecolorStats,
             frames: T,
             selections: &'a [PatchSelection],
+            alignment: &'a [AlignmentRecord],
         }
         let report = Report {
             config: &self.config,
             stats: &result.stats,
             frames,
             selections: &result.selections,
+            alignment: &result.alignment,
         };
         let mut writer = BufWriter::new(File::create(path)?);
         serde_json::to_writer_pretty(&mut writer, &report)?;
@@ -1301,6 +1375,18 @@ impl DepthRaster {
         }
         result
     }
+    fn has_depth_discontinuity(&self, u: u32, v: u32, z: f64, margin: f64, radius: u32) -> bool {
+        for y in v.saturating_sub(radius)..=v.saturating_add(radius).min(self.height - 1) {
+            for x in u.saturating_sub(radius)..=u.saturating_add(radius).min(self.width - 1) {
+                let depth = self.nearest_z[y as usize * self.width as usize + x as usize];
+                if depth.is_finite() && (depth as f64 - z).abs() > margin {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn classify(&self, u: u32, v: u32, z: f64, margin: f64, radius: u32) -> DepthState {
         if u >= self.width || v >= self.height || !z.is_finite() || z <= 0.0 {
             return DepthState::Unknown;
@@ -1469,6 +1555,103 @@ mod tests {
         assert_eq!(normal_axis(Some(&Vector3::new(1.0, 0.0, 0.0))), 0);
         assert_eq!(normal_axis(Some(&Vector3::zeros())), 3);
         assert_eq!(spatial_key(&Point3::new(f64::NAN, 0.0, 0.0), 0.5), None);
+    }
+
+    #[test]
+    fn alignment_pipeline_corrects_colors_with_one_shared_shift_and_preserves_point_count() {
+        let scratch = Scratch::new();
+        let mut cfg = config();
+        cfg.region_size_m = 1.0;
+        cfg.coherence_weight = 0.0; // 比較のため2枚の独立選択を残す。
+        let mut state = RegionalRecolor::new(cfg, &scratch.0).unwrap();
+        let reference = RgbImage::from_fn(960, 600, |x, y| {
+            let mut value = (x as u64).wrapping_mul(0x9e3779b97f4a7c15)
+                ^ (y as u64).wrapping_mul(0xbf58476d1ce4e5b9);
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+            let gray = (value ^ (value >> 31)) as u8;
+            image::Rgb([gray, 255 - gray, gray])
+        });
+        let target = RgbImage::from_fn(960, 600, |x, y| {
+            shifted_pixel([x, y], [-2, 1], 960, 600)
+                .map_or(image::Rgb([0, 0, 0]), |p| *reference.get_pixel(p[0], p[1]))
+        });
+        let raw: Vec<_> = (-20..=20)
+            .filter(|&x| x != 0)
+            .flat_map(|x| (-10..10).map(move |y| point(x as f32 * 0.035, y as f32 * 0.03, 5.1)))
+            .collect();
+        let left: Vec<_> = raw.iter().copied().filter(|p| p.x < 0.0).collect();
+        let right: Vec<_> = raw.iter().copied().filter(|p| p.x > 0.0).collect();
+        record(
+            &mut state,
+            0,
+            "reference",
+            &reference,
+            &Matrix4::identity(),
+            &left,
+        );
+        record(
+            &mut state,
+            1,
+            "target",
+            &target,
+            &Matrix4::identity(),
+            &right,
+        );
+        let points: Vec<_> = raw.iter().copied().map(surface).collect();
+        let load = |path: &Path| {
+            Ok(if path == Path::new("reference") {
+                reference.clone()
+            } else {
+                target.clone()
+            })
+        };
+        let before = state.recolor_points(&points, load).unwrap();
+        assert_eq!(before.stats.images_loaded_for_alignment, 0);
+        state.config.alignment.enabled = true;
+        let after = state.recolor_points(&points, load).unwrap();
+        assert_eq!(after.stats.colored_points, before.stats.colored_points);
+        assert_eq!(after.stats.colored_points, points.len());
+        assert_eq!(after.alignment.len(), 1);
+        let alignment = &after.alignment[0];
+        assert!(alignment.estimate.accepted, "{:?}", alignment.estimate);
+        assert_eq!(alignment.reference_frame_index, 0);
+        assert_eq!(alignment.estimate.shift_px, [2, -1]);
+        assert!(alignment.target_patches.len() >= 2);
+        assert_eq!(after.stats.alignment_shifted_points, right.len());
+        assert_eq!(after.stats.alignment_guarded_points, 0);
+        let camera = CameraIntrinsics::for_image_size(960, 600).unwrap();
+        let mut mismatches_before = 0;
+        for (index, p) in raw.iter().enumerate() {
+            let (u, v) = project_camera_point_full_image(&p.cast::<f64>(), &camera).unwrap();
+            let expected = Some(reference.get_pixel(u, v).0);
+            if before.colors[index] != expected {
+                mismatches_before += 1;
+            }
+            assert_eq!(after.colors[index], expected, "point {index}");
+            assert_eq!(points[index].position, *p);
+        }
+        assert!(mismatches_before > right.len() * 9 / 10);
+        let path = scratch.0.join("aligned_report.json");
+        state.write_report(&path, &after).unwrap();
+        let report: serde_json::Value = serde_json::from_reader(File::open(path).unwrap()).unwrap();
+        assert_eq!(
+            report["alignment"][0]["estimate"]["shift_px"],
+            serde_json::json!([2, -1])
+        );
+        assert_eq!(report["stats"]["alignment_accepted_pairs"], 1);
+    }
+
+    #[test]
+    fn alignment_guard_detects_both_sides_of_depth_edges() {
+        let camera = CameraIntrinsics::for_image_size(960, 600).unwrap();
+        let mut depth = DepthRaster::build(&[], &Matrix4::identity(), &camera);
+        assert!(!depth.has_depth_discontinuity(100, 100, 5.0, 0.2, 5));
+        depth.nearest_z[100 * 960 + 104] = 3.0;
+        assert!(depth.has_depth_discontinuity(100, 100, 5.0, 0.2, 5));
+        assert!(!depth.has_depth_discontinuity(100, 100, 5.0, 0.2, 2));
+        depth.nearest_z[100 * 960 + 104] = 7.0;
+        assert!(depth.has_depth_discontinuity(100, 100, 5.0, 0.2, 5));
     }
 
     fn selection(node: usize, frame: usize, score: f64) -> PatchSelection {
