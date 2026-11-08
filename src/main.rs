@@ -650,7 +650,7 @@ fn main() -> Result<()> {
     let camera_from_lidar = build_camera_from_lidar(
         Vector3::new(0.01, 0.2, 0.035), // カメラ位置 [m]
         -1.0,                           // roll [deg]
-        0.0,                          // pitch [deg]
+        1.5,                          // pitch [deg]
         0.0,                          // yaw [deg]
     );
 
