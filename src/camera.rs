@@ -13,8 +13,9 @@ pub fn build_camera_from_lidar(
     pitch_deg: f64,
     yaw_deg: f64,
 ) -> Matrix4<f64> {
-    // 以前の着色コードと同じ軸変換。
-    let r_nominal = Matrix3::<f64>::new(0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0);
+    // LiDAR(x前・y左・z上) → カメラ(x右・y下・z前) の標準的な軸変換。
+    // x_cam = -y_lidar, y_cam = -z_lidar, z_cam = x_lidar (画像の反転なし)
+    let r_nominal = Matrix3::<f64>::new(0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0);
 
     let camera_mount = Rotation3::from_euler_angles(
         roll_deg.to_radians(),
@@ -59,11 +60,11 @@ impl CameraIntrinsics {
         Ok(Self {
             width,
             height,
-            fx: 1282.49623 * scale,
-            fy: 1287.95761 * scale,
-            cx: 928.79093 * scale,
-            cy: 671.31092 * scale,
-            distortion: [-0.040856, -0.004680, 0.010953, -0.002704, 0.0],
+            fx: 1175.019462 * scale,
+            fy: 1177.567371 * scale,
+            cx: 939.439350 * scale,
+            cy: 627.068368 * scale,
+            distortion: [-0.136349, 0.028462, -0.002188, 0.001479, 0.0],
         })
     }
 }
@@ -444,8 +445,8 @@ mod single_image_recolor_tests {
     #[test]
     fn samples_the_final_world_coordinate_instead_of_the_original_observation() {
         let mut image = image();
-        image.put_pixel(464, 336, image::Rgb([255, 0, 0]));
-        image.put_pixel(468, 336, image::Rgb([0, 255, 0]));
+        image.put_pixel(470, 314, image::Rgb([255, 0, 0]));
+        image.put_pixel(473, 314, image::Rgb([0, 255, 0]));
         let original = Point3::new(0.0_f32, 0.0, 5.0);
         let reference = SingleImageColorReference::capture(
             &image,
@@ -473,7 +474,7 @@ mod single_image_recolor_tests {
         camera_from_world[(0, 3)] = -1.0;
         let mut world_from_lidar = Matrix4::identity();
         world_from_lidar[(0, 3)] = 1.0;
-        image.put_pixel(464, 336, image::Rgb([1, 2, 3]));
+        image.put_pixel(470, 314, image::Rgb([1, 2, 3]));
         let reference = SingleImageColorReference::capture(
             &image,
             &camera_from_world,
@@ -482,7 +483,7 @@ mod single_image_recolor_tests {
             None,
         )
         .unwrap();
-        image.put_pixel(464, 336, image::Rgb([9, 9, 9]));
+        image.put_pixel(470, 314, image::Rgb([9, 9, 9]));
         camera_from_world[(0, 3)] = 100.0;
         assert_eq!(
             reference.color_for_world_point(&Point3::new(1.0, 0.0, 5.0), 0.2, 0),
@@ -508,15 +509,15 @@ mod single_image_recolor_tests {
     fn roi_uses_inclusive_left_top_and_exclusive_right_bottom() {
         let point = Point3::new(0.0_f32, 0.0, 5.0);
         assert_eq!(
-            capture(&[point], Some([464, 336, 465, 337])).color_for_world_point(&point, 0.2, 0),
+            capture(&[point], Some([470, 314, 471, 315])).color_for_world_point(&point, 0.2, 0),
             Some([10, 20, 30]),
         );
         assert_eq!(
-            capture(&[point], Some([0, 0, 464, 600])).color_for_world_point(&point, 0.2, 0),
+            capture(&[point], Some([0, 0, 470, 600])).color_for_world_point(&point, 0.2, 0),
             None,
         );
         assert_eq!(
-            capture(&[point], Some([0, 0, 960, 336])).color_for_world_point(&point, 0.2, 0),
+            capture(&[point], Some([0, 0, 960, 314])).color_for_world_point(&point, 0.2, 0),
             None,
         );
     }

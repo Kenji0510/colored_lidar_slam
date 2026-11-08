@@ -33,9 +33,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/10042026/03";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/11072026/01";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
-const SAVE_ROOT_DIR: &str = "data/output/10242026";
+const SAVE_ROOT_DIR: &str = "data/output/11072026";
 
 // 遮蔽の色更新ゲート。まずはこの値で確認する。
 const COLOR_OCCLUSION_MARGIN_M: f64 = 0.20;
@@ -648,10 +648,10 @@ fn main() -> Result<()> {
     let mut frame_logs: Vec<FrameLog> = Vec::new();
 
     let camera_from_lidar = build_camera_from_lidar(
-        Vector3::new(0.04, 0.0, 0.05), // カメラ位置 [m]
-        0.0,                           // roll [deg]
-        -1.8,                          // pitch [deg]
-        -2.2,                          // yaw [deg]
+        Vector3::new(0.01, 0.2, 0.035), // カメラ位置 [m]
+        -1.0,                           // roll [deg]
+        0.0,                          // pitch [deg]
+        0.0,                          // yaw [deg]
     );
 
     let mut single_image_color_reference: Option<SingleImageColorReference> = None;
