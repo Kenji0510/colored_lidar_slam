@@ -13,3 +13,4 @@ pub mod voxelization;
 
 pub mod regional_recolor;
 pub mod patch_alignment;
+pub mod camera_pose_alignment;

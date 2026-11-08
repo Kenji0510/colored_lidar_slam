@@ -14,6 +14,7 @@ use std::{
 };
 
 use crate::camera::{CameraIntrinsics, project_camera_point_full_image};
+use crate::camera_pose_alignment::{CameraPoseAlignmentConfig, sample_rgb_bilinear};
 use crate::patch_alignment::{
     AlignmentEstimate, PatchAlignmentConfig, estimate_translation, plane_patch_samples,
     reference_texture, shifted_pixel,
@@ -21,6 +22,10 @@ use crate::patch_alignment::{
 
 #[path = "regional_alignment.rs"]
 mod alignment;
+
+#[path = "regional_pose_alignment.rs"]
+mod pose_alignment;
+pub use pose_alignment::{CameraPoseAlignmentRecord, CameraPoseAlignmentStats};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RegionalRecolorConfig {
@@ -44,6 +49,7 @@ pub struct RegionalRecolorConfig {
     pub coherence_plane_distance_m: f64,
     pub coherence_neighbor_candidates: usize,
     pub alignment: PatchAlignmentConfig,
+    pub pose_alignment: CameraPoseAlignmentConfig,
 }
 
 impl Default for RegionalRecolorConfig {
@@ -65,6 +71,7 @@ impl Default for RegionalRecolorConfig {
             coherence_plane_distance_m: 0.05,
             coherence_neighbor_candidates: 4,
             alignment: PatchAlignmentConfig::default(),
+            pose_alignment: CameraPoseAlignmentConfig::default(),
         }
     }
 }
@@ -72,6 +79,9 @@ impl Default for RegionalRecolorConfig {
 impl RegionalRecolorConfig {
     pub fn validate(&self) -> Result<()> {
         self.alignment.validate()?;
+        self.pose_alignment.validate()?;
+        ensure!(!(self.alignment.enabled && self.pose_alignment.enabled),
+            "choose either 2D patch alignment or shared 6-DoF camera pose alignment");
         ensure!(
             self.region_size_m.is_finite() && self.region_size_m > 0.0,
             "region_size_m must be finite and positive"
@@ -214,6 +224,7 @@ impl CandidatePool {
     }
 }
 
+#[derive(Clone)]
 struct CachedFrame {
     frame_index: usize,
     timestamp_sec: f64,
@@ -258,6 +269,7 @@ pub struct RegionalRecolorStats {
     pub alignment_shifted_points: usize,
     pub alignment_guarded_points: usize,
     pub images_loaded_for_alignment: usize,
+    pub camera_pose_alignment: CameraPoseAlignmentStats,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -291,6 +303,7 @@ pub struct RegionalRecolorResult {
     pub stats: RegionalRecolorStats,
     pub selections: Vec<PatchSelection>,
     pub alignment: Vec<AlignmentRecord>,
+    pub camera_poses: Vec<CameraPoseAlignmentRecord>,
 }
 
 pub struct RegionalRecolor {
@@ -520,6 +533,11 @@ impl RegionalRecolor {
             }
         }
 
+        // Refine poses before scoring/selection so all coverage, distance, depth,
+        // and RGB queries use the same corrected camera geometry.
+        let (frames, camera_poses) = self.pose_aligned_frames(
+            &patches, points, &adjacency, &by_frame, &mut load_image, &mut stats,
+        )?;
         let mut options: Vec<Vec<PatchSelection>> = vec![Vec::new(); patches.len()];
         let scoring_total = by_frame.len();
         for (step, (frame_id, patch_indices)) in by_frame.into_iter().enumerate() {
@@ -530,7 +548,7 @@ impl RegionalRecolor {
                     scoring_total
                 );
             }
-            let frame = &self.frames[frame_id];
+            let frame = &frames[frame_id];
             let image = load_image(&frame.image_path).with_context(|| {
                 format!("loading reference image {}", frame.image_path.display())
             })?;
@@ -642,7 +660,7 @@ impl RegionalRecolor {
                     coloring_total
                 );
             }
-            let frame = &self.frames[frame_id];
+            let frame = &frames[frame_id];
             let image = load_image(&frame.image_path)?;
             ensure!(
                 image.dimensions() == (frame.intrinsics.width, frame.intrinsics.height),
@@ -685,10 +703,17 @@ impl RegionalRecolor {
                                 stats.alignment_guarded_points += 1;
                             }
                         }
-                        let rgb = image
-                            .get_pixel_checked(pixel[0], pixel[1])
-                            .context("reference pixel is outside image")?
-                            .0;
+                        let rgb = if self.config.pose_alignment.enabled {
+                            let camera_point = frame.camera_from_world
+                                .transform_point(&points[index].position.cast::<f64>());
+                            let Some((u, v)) = crate::camera::project_camera_point_continuous(
+                                &camera_point, &frame.intrinsics) else { continue; };
+                            let Some(rgb) = sample_rgb_bilinear(&image, [u, v]) else { continue; };
+                            rgb
+                        } else {
+                            image.get_pixel_checked(pixel[0], pixel[1])
+                                .context("reference pixel is outside image")?.0
+                        };
                         colors[index] = Some(rgb);
                         stats.colored_points += 1;
                         winner.colored_count += 1;
@@ -716,6 +741,7 @@ impl RegionalRecolor {
             stats,
             selections,
             alignment,
+            camera_poses,
         })
     }
 
@@ -808,11 +834,15 @@ impl RegionalRecolor {
             timestamp_sec: f64,
             image_path: &'a Path,
             depth_path: &'a Path,
+            original_depth_path: &'a Path,
             width: u32,
             height: u32,
             /// nalgebraの列優先順。
             camera_from_world_column_major: [f64; 16],
+            original_camera_from_world_column_major: [f64; 16],
         }
+        let poses_by_observation: HashMap<usize, &CameraPoseAlignmentRecord> = result.camera_poses.iter()
+            .flat_map(|pose| pose.shared_by_frame_indices.iter().map(move |&id| (id, pose))).collect();
         let frames: Vec<_> = self
             .frames
             .iter()
@@ -820,15 +850,18 @@ impl RegionalRecolor {
             .map(|(id, frame)| {
                 let mut matrix = [0.0; 16];
                 matrix.copy_from_slice(frame.camera_from_world.as_slice());
+                let corrected = poses_by_observation.get(&frame.frame_index);
                 FrameReport {
                     frame_id: id,
                     frame_index: frame.frame_index,
                     timestamp_sec: frame.timestamp_sec,
                     image_path: &frame.image_path,
-                    depth_path: &frame.depth_path,
+                    depth_path: corrected.map_or(frame.depth_path.as_path(), |pose| pose.corrected_depth_path.as_path()),
+                    original_depth_path: &frame.depth_path,
                     width: frame.intrinsics.width,
                     height: frame.intrinsics.height,
-                    camera_from_world_column_major: matrix,
+                    camera_from_world_column_major: corrected.map_or(matrix, |pose| pose.corrected_camera_from_world_column_major),
+                    original_camera_from_world_column_major: matrix,
                 }
             })
             .collect();
@@ -839,6 +872,7 @@ impl RegionalRecolor {
             frames: T,
             selections: &'a [PatchSelection],
             alignment: &'a [AlignmentRecord],
+            camera_poses: &'a [CameraPoseAlignmentRecord],
         }
         let report = Report {
             config: &self.config,
@@ -846,6 +880,7 @@ impl RegionalRecolor {
             frames,
             selections: &result.selections,
             alignment: &result.alignment,
+            camera_poses: &result.camera_poses,
         };
         let mut writer = BufWriter::new(File::create(path)?);
         serde_json::to_writer_pretty(&mut writer, &report)?;
@@ -1353,6 +1388,28 @@ struct DepthRaster {
     nearest_z: Vec<f32>,
 }
 impl DepthRaster {
+    /// Reproject the original observed depths through the camera-pose change.
+    /// Never compare corrected pixels against an uncorrected depth raster.
+    fn reproject(&self, new_from_old: &Matrix4<f64>, camera: &CameraIntrinsics) -> Self {
+        let mut result = Self::build(&[], &Matrix4::identity(), camera);
+        for (index, &z) in self.nearest_z.iter().enumerate() {
+            if !z.is_finite() || z <= 0.0 { continue; }
+            let (u, v) = ((index % self.width as usize) as f64, (index / self.width as usize) as f64);
+            let Some(ray) = crate::camera::camera_ray_for_pixel(u, v, camera) else { continue; };
+            let p = new_from_old.transform_point(&Point3::from(ray * z as f64));
+            if let Some((x, y)) = project_camera_point_full_image(&p, camera) {
+                let index = y as usize * result.width as usize + x as usize;
+                result.nearest_z[index] = result.nearest_z[index].min(p.z as f32);
+            }
+        }
+        result
+    }
+
+    fn merge(&mut self, other: &Self) {
+        debug_assert_eq!((self.width, self.height), (other.width, other.height));
+        for (a, b) in self.nearest_z.iter_mut().zip(&other.nearest_z) { *a = a.min(*b); }
+    }
+
     fn build(
         points: &[Point3<f32>],
         camera_from_lidar: &Matrix4<f64>,
@@ -2182,11 +2239,14 @@ mod tests {
         depth.write_sparse(&file).unwrap();
         assert_eq!(fs::metadata(&file).unwrap().len(), 24 + 2 * 8);
         let restored = DepthRaster::read_sparse(&file, &camera).unwrap();
+        // Derive the pixel from the current calibration, rather than keeping
+        // the principal point from an older camera-calibration result.
+        let (u, v) = project_camera_point_full_image(&Point3::new(0.0, 0.0, 3.0), &camera).unwrap();
         assert_eq!(
-            restored.classify(464, 336, 8.0, 0.2, 0),
+            restored.classify(u, v, 8.0, 0.2, 0),
             DepthState::Occluded
         );
-        assert_eq!(restored.classify(464, 336, 3.0, 0.2, 0), DepthState::Clear);
+        assert_eq!(restored.classify(u, v, 3.0, 0.2, 0), DepthState::Clear);
         assert_eq!(restored.classify(0, 0, 3.0, 0.2, 0), DepthState::Unknown);
         fs::write(&file, b"invalid").unwrap();
         assert!(DepthRaster::read_sparse(&file, &camera).is_err());

@@ -109,6 +109,7 @@ struct RunOptions {
     recolor_every: usize,
     recolor_coherence_weight: f64,
     recolor_align: bool,
+    recolor_pose_align: bool,
 }
 
 enum CommandLineAction {
@@ -129,6 +130,7 @@ where
     let mut recolor_every = regional_defaults.evaluate_every;
     let mut recolor_coherence_weight = regional_defaults.coherence_weight;
     let mut recolor_align = false;
+    let mut recolor_pose_align = false;
     let mut regional_option_given = false;
     let mut args = args.into_iter();
 
@@ -167,6 +169,10 @@ where
                 recolor_roi = Some(parse_recolor_roi(&argument["--recolor-roi=".len()..])?);
             }
             "--recolor-auto" => recolor_auto = true,
+            "--recolor-pose-align" => {
+                recolor_pose_align = true;
+                regional_option_given = true;
+            }
             "--recolor-align" => {
                 recolor_align = true;
                 regional_option_given = true;
@@ -209,7 +215,12 @@ where
 
     anyhow::ensure!(
         !regional_option_given || recolor_auto,
-        "--recolor-region-size, --recolor-every, --recolor-coherence-weight and --recolor-align require --recolor-auto"
+        "--recolor-region-size, --recolor-every, --recolor-coherence-weight, --recolor-align and --recolor-pose-align require --recolor-auto"
+    );
+
+    anyhow::ensure!(
+        !(recolor_align && recolor_pose_align),
+        "--recolor-align and --recolor-pose-align are alternative alignment modes; choose one"
     );
 
     Ok(CommandLineAction::Run(RunOptions {
@@ -221,6 +232,7 @@ where
         recolor_every,
         recolor_coherence_weight,
         recolor_align,
+        recolor_pose_align,
     }))
 }
 
@@ -279,7 +291,7 @@ fn parse_recolor_coherence_weight(value: &str) -> Result<f64> {
 }
 
 fn print_usage() {
-    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>] [--recolor-frame N] [--recolor-roi x0,y0,x1,y1] [--recolor-auto] [--recolor-region-size M] [--recolor-every N] [--recolor-coherence-weight W] [--recolor-align]");
+    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>] [--recolor-frame N] [--recolor-roi x0,y0,x1,y1] [--recolor-auto] [--recolor-region-size M] [--recolor-every N] [--recolor-coherence-weight W] [--recolor-align | --recolor-pose-align]");
     println!("  --lidar  Select the point-cloud sensor (default: mid70)");
     println!("  --recolor-frame  Save a separate final map colored from the image selected at PCD frame N (zero-based)");
     println!("  --recolor-roi    Optional rectangle for --recolor-frame; right/bottom edges are exclusive");
@@ -288,6 +300,7 @@ fn print_usage() {
     println!("  --recolor-every        Candidate frame interval (default: 5)");
     println!("  --recolor-coherence-weight  Prefer a shared image on adjacent coplanar regions (default: 0.35; 0 disables)");
     println!("  --recolor-align  Refine color sampling by a small shared image shift per plane and source image (default: off)");
+    println!("  --recolor-pose-align  Refine one shared 6-DoF camera pose per source image before regional recoloring (default: off)");
 }
 
 // Mid-70 sparse-cloud preset.
@@ -665,14 +678,16 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         config.alignment.enabled = run_options.recolor_align;
+        config.pose_alignment.enabled = run_options.recolor_pose_align;
         let recolor = RegionalRecolor::new(
             config,
             std::path::Path::new(&save_dir).join("regional_recolor_cache"),
         )?;
-        log::info!("Regional recolor: size={} m, every={} frames, coherence={}, align={}, cache={}",
+        log::info!("Regional recolor: size={} m, every={} frames, coherence={}, align={}, pose_align={}, cache={}",
             run_options.recolor_region_size_m, run_options.recolor_every,
             run_options.recolor_coherence_weight,
             run_options.recolor_align,
+            run_options.recolor_pose_align,
             recolor.cache_dir().display());
         Some(recolor)
     } else {
@@ -1909,7 +1924,9 @@ fn main() -> Result<()> {
         let colored: Vec<PointXYZRGB> = points.iter().zip(&result.colors)
             .filter_map(|(point, rgb)| rgb.map(|rgb| PointXYZRGB::new(point.position, rgb)))
             .collect();
-        let suffix = if run_options.recolor_align {
+        let suffix = if run_options.recolor_pose_align {
+            "regional_pose_aligned"
+        } else if run_options.recolor_align {
             "regional_aligned"
         } else if run_options.recolor_coherence_weight > 0.0 {
             "regional_coherent"
@@ -1921,7 +1938,9 @@ fn main() -> Result<()> {
         } else {
             save_pcd_xyzrgb(&colored, &output_path)?;
         }
-        let report_name = if run_options.recolor_align {
+        let report_name = if run_options.recolor_pose_align {
+            "regional_recolor_pose_aligned_report.json"
+        } else if run_options.recolor_align {
             "regional_recolor_aligned_report.json"
         } else if run_options.recolor_coherence_weight > 0.0 {
             "regional_recolor_coherent_report.json"
@@ -2365,6 +2384,20 @@ mod tests {
         assert_eq!(options.recolor_every, 5);
         assert_eq!(options.recolor_coherence_weight, 0.35);
         assert!(!options.recolor_align);
+    }
+
+    #[test]
+    fn command_line_pose_alignment_is_explicit_and_exclusive() {
+        assert!(parse_args(&["--recolor-pose-align"]).is_err());
+        assert!(parse_args(&["--recolor-auto", "--recolor-align", "--recolor-pose-align"]).is_err());
+        let CommandLineAction::Run(options) = parse_args(&[
+            "--lidar", "avia", "--recolor-auto", "--recolor-region-size", "1.0",
+            "--recolor-every", "5", "--recolor-pose-align",
+        ]).unwrap() else { panic!() };
+        assert!(options.recolor_pose_align && options.recolor_auto);
+        assert!(!options.recolor_align);
+        let CommandLineAction::Run(options) = parse_args(&["--recolor-auto"]).unwrap() else { panic!() };
+        assert!(!options.recolor_pose_align);
     }
 
     #[test]
