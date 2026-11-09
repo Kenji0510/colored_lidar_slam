@@ -21,9 +21,12 @@ use re_lidar_slam::{
     },
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory},
     types::{CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap},
+    visual_alignment::{
+        VisualAligner, VisualAlignmentConfig, VisualFrame, VisualPoint, fit_visual_point,
+    },
     voxel_map::{
-        ColorObservation, LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus,
-        WorldMapUpdateFilterConfig,
+        ColorObservation, LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus, VoxelKey,
+        WorldMapUpdateFilterConfig, voxel_key,
     },
     voxelization::{voxel_downsample_points, voxel_downsample_points_and_maps_dual},
 };
@@ -97,7 +100,7 @@ impl LidarModel {
 }
 
 enum CommandLineAction {
-    Run(LidarModel),
+    Run(LidarModel, bool),
     Help,
 }
 
@@ -106,6 +109,7 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut lidar_model = LidarModel::Mid70;
+    let mut visual_align = false;
     let mut args = args.into_iter();
 
     while let Some(argument) = args.next() {
@@ -115,6 +119,7 @@ where
 
         match argument.as_str() {
             "-h" | "--help" => return Ok(CommandLineAction::Help),
+            "--visual-align" => visual_align = true,
             "--lidar" => {
                 let value = args
                     .next()
@@ -132,12 +137,13 @@ where
         }
     }
 
-    Ok(CommandLineAction::Run(lidar_model))
+    Ok(CommandLineAction::Run(lidar_model, visual_align))
 }
 
 fn print_usage() {
-    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>]");
+    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>] [--visual-align]");
     println!("  --lidar  Select the point-cloud sensor (default: mid70)");
+    println!("  --visual-align  Refine the coloring camera pose using stored image patches");
 }
 
 // Mid-70 sparse-cloud preset.
@@ -177,9 +183,8 @@ const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.01; // m
 // GlobalMap voxel が増える。点群は主に面なので、voxel 数は (0.025 / size)^2 で
 // 増えるとみなして換算する。入力フレーム数から最終容量を先に確保し、実行途中の
 // 巨大な HashMap 再配置（数百 ms のスパイク）を避ける。
-const GLOBAL_MAP_EXPECTED_NEW_VOXELS_PER_FRAME: usize = (2048.0
-    * (0.025 / GLOBAL_MAP_VOXEL_SIZE)
-    * (0.025 / GLOBAL_MAP_VOXEL_SIZE)) as usize;
+const GLOBAL_MAP_EXPECTED_NEW_VOXELS_PER_FRAME: usize =
+    (2048.0 * (0.025 / GLOBAL_MAP_VOXEL_SIZE) * (0.025 / GLOBAL_MAP_VOXEL_SIZE)) as usize;
 // GlobalMap の近傍探索半径を voxel サイズに依存しない物理長で指定し、voxel 数へ換算する。
 const fn global_map_radius_voxels(radius_m: f32) -> i32 {
     (radius_m / GLOBAL_MAP_VOXEL_SIZE).ceil() as i32
@@ -381,18 +386,70 @@ fn count_imu_samples_in_time_range(imu_data: &[IMU], start_time: f64, end_time: 
     end_idx.saturating_sub(start_idx)
 }
 
+/// Use accumulated local-map means to estimate support planes for current scan anchors.
+/// Neighbor lookup is bounded: <=1600 seeds x 125 voxel cells. Geometry is read-only.
+fn visual_candidates_from_local_map(
+    lidar_points: &[Point3<f32>],
+    world_from_lidar: &Matrix4<f64>,
+    map: &LOCALMap,
+) -> Vec<VisualPoint> {
+    if lidar_points.is_empty() || map.voxel_map.is_empty() {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let stride = lidar_points.len().div_ceil(1600);
+    for p in lidar_points.iter().step_by(stride) {
+        let center = world_from_lidar.transform_point(&p.cast::<f64>());
+        if !center.coords.iter().all(|v| v.is_finite()) {
+            continue;
+        }
+        let key = voxel_key(&center.cast::<f32>(), map.config.index_voxel_size);
+        if !visited.insert((key.ix, key.iy, key.iz)) {
+            continue;
+        }
+        let mut neighbors = Vec::with_capacity(64);
+        for dz in -2..=2 {
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    let neighbor_key = VoxelKey {
+                        ix: key.ix + dx,
+                        iy: key.iy + dy,
+                        iz: key.iz + dz,
+                    };
+                    if let Some(cell) = map.voxel_map.get(&neighbor_key) {
+                        let q = cell.mean.cast::<f64>();
+                        if (q - center).norm() <= 0.60 {
+                            neighbors.push(q);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(point) = fit_visual_point(center, &neighbors) {
+            result.push(point);
+        }
+    }
+    result
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
-    let lidar_model = match parse_command_line(std::env::args_os().skip(1))? {
-        CommandLineAction::Run(lidar_model) => lidar_model,
+    let (lidar_model, visual_align) = match parse_command_line(std::env::args_os().skip(1))? {
+        CommandLineAction::Run(lidar_model, visual_align) => (lidar_model, visual_align),
         CommandLineAction::Help => {
             print_usage();
             return Ok(());
         }
     };
     let load_dir = format!("{DATASET_DIR}/{}", lidar_model.input_subdir());
-    let save_dir = format!("{SAVE_ROOT_DIR}/{}", lidar_model.name());
+    let save_dir = if visual_align {
+        format!("{SAVE_ROOT_DIR}/{}_visual_aligned", lidar_model.name())
+    } else {
+        format!("{SAVE_ROOT_DIR}/{}", lidar_model.name())
+    };
+    std::fs::create_dir_all(&save_dir)?;
     let imu_to_lidar = lidar_model.imu_to_lidar_rotation();
     let imu_origin_in_lidar_frame = lidar_model.imu_origin_in_lidar_frame_m();
     log::info!(
@@ -491,9 +548,16 @@ fn main() -> Result<()> {
     let camera_from_lidar = build_camera_from_lidar(
         Vector3::new(0.01, 0.1, 0.035), // カメラ位置 [m]
         -1.0,                           // roll [deg]
-        4.0,                          // pitch [deg]
-        0.0,                          // yaw [deg]
+        3.0,                            // pitch [deg]
+        0.0,                            // yaw [deg]
     );
+
+    // Visual corrections are used only by coloring, never fed back into ESKF/ICP.
+    let mut visual_aligner = visual_align
+        .then(|| VisualAligner::new(VisualAlignmentConfig::default()))
+        .transpose()?;
+    let mut visual_reports = Vec::new();
+    log::info!("Online image-patch alignment enabled={visual_align}");
 
     //
     for (i, pcd_path) in pcd_files.iter().enumerate() {
@@ -1135,7 +1199,7 @@ fn main() -> Result<()> {
                 None
             };
 
-        let camera_from_world_at_image: Option<Matrix4<f64>> = lidar_pose_at_image_time
+        let mut camera_from_world_at_image: Option<Matrix4<f64>> = lidar_pose_at_image_time
             .as_ref()
             .and_then(|world_from_lidar| {
                 world_from_lidar
@@ -1147,6 +1211,70 @@ fn main() -> Result<()> {
             log::debug!("Frame {i}: camera_from_world_at_image=\n{}", transform,);
         }
         let coloring_image_pose_time = coloring_image_pose_start.elapsed();
+
+        // LiDAR map geometry remains fixed. Only this image's camera pose is refined.
+        let coloring_visual_alignment_start = Instant::now();
+        if let (Some(aligner), Some(rgb_image), Some(prior), Some(metadata)) = (
+            visual_aligner.as_mut(),
+            selected_rgb_image.as_ref(),
+            camera_from_world_at_image,
+            selected_image,
+        ) {
+            let geometry_trusted = local_map_was_empty || icp_ok;
+            let intrinsics =
+                CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
+            let candidates = if geometry_trusted {
+                visual_candidates_from_local_map(
+                    &downsampled_source_points_for_local,
+                    &current_frame_info.current_global_pose,
+                    &slam_map.local_voxel_map,
+                )
+            } else {
+                Vec::new()
+            };
+            let geometry_world: Vec<Point3<f64>> = if geometry_trusted {
+                deskewed_points
+                    .iter()
+                    .map(|p| {
+                        current_frame_info
+                            .current_global_pose
+                            .transform_point(&p.cast::<f64>())
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let result = aligner.process(VisualFrame {
+                image_key: &metadata.file_name,
+                timestamp_sec: metadata.timestamp_sec,
+                image: rgb_image,
+                camera: &intrinsics,
+                camera_from_world_prior: &prior,
+                geometry_world: &geometry_world,
+                new_points: &candidates,
+                geometry_trusted,
+            })?;
+            log::info!(
+                "Frame {i}: visual_align={} applied={} patches={} train={} validation={} \
+                 inliers={} refs={} added={} rotation={:.4} deg translation={:.4} m \
+                 validation_rmse={:?}->{:?}",
+                result.report.status,
+                result.report.applied,
+                result.report.visible_patches,
+                result.report.train_patches,
+                result.report.validation_patches,
+                result.report.inlier_patches,
+                result.report.reference_points,
+                result.report.added_points,
+                result.report.rotation_correction_deg,
+                result.report.translation_correction_m,
+                result.report.initial_validation_rmse_gray,
+                result.report.final_validation_rmse_gray,
+            );
+            camera_from_world_at_image = Some(result.camera_from_world);
+            visual_reports.push(result.report);
+        }
+        let coloring_visual_alignment_time = coloring_visual_alignment_start.elapsed();
 
         let coloring_projection_start = Instant::now();
         let (projected_pixels, color_depth_map) =
@@ -1406,6 +1534,7 @@ fn main() -> Result<()> {
         let coloring_time = coloring_image_select_time
             + coloring_image_load_time
             + coloring_image_pose_time
+            + coloring_visual_alignment_time
             + coloring_projection_time
             + coloring_colorize_time
             + coloring_global_rgb_time;
@@ -1433,6 +1562,7 @@ fn main() -> Result<()> {
             coloring_image_select_ms: duration_ms(coloring_image_select_time),
             coloring_image_load_ms: duration_ms(coloring_image_load_time),
             coloring_image_pose_ms: duration_ms(coloring_image_pose_time),
+            // coloring_visual_alignment_ms: duration_ms(coloring_visual_alignment_time),
             coloring_projection_ms: duration_ms(coloring_projection_time),
             coloring_colorize_ms: duration_ms(coloring_colorize_time),
             coloring_global_rgb_ms: duration_ms(coloring_global_rgb_time),
@@ -1463,11 +1593,12 @@ fn main() -> Result<()> {
         );
         log::debug!(
             "Frame {i} coloring breakdown [ms]: image_select={:.3} ms, image_load={:.3} ms, \
-             image_pose={:.3} ms, projection={:.3} ms, colorize={:.3} ms, \
+             image_pose={:.3} ms, visual_alignment={:.3} ms, projection={:.3} ms, \
              global_rgb={:.3} ms, total={:.3} ms",
             timing.coloring_image_select_ms,
             timing.coloring_image_load_ms,
             timing.coloring_image_pose_ms,
+            // timing.coloring_visual_alignment_ms,
             timing.coloring_projection_ms,
             timing.coloring_colorize_ms,
             timing.coloring_global_rgb_ms,
@@ -1560,6 +1691,16 @@ fn main() -> Result<()> {
         world_map_points_before_plane_filter_xyz.len(),
         world_map_before_plane_filter_path,
     );
+
+    if visual_align {
+        let report_path = std::path::Path::new(&save_dir).join("visual_alignment_report.json");
+        let report_file = std::fs::File::create(&report_path)?;
+        // Explicit flush propagates write errors instead of ignoring BufWriter::drop failures.
+        let mut writer = std::io::BufWriter::new(report_file);
+        serde_json::to_writer_pretty(&mut writer, &visual_reports)?;
+        std::io::Write::flush(&mut writer)?;
+        log::info!("Saved image alignment report: {}", report_path.display());
+    }
 
     // 終端処理: 遅延キューの状態に依存せず、現在の全累積点で全セルを再判定する。
     let final_surface_start = Instant::now();
@@ -1765,6 +1906,7 @@ fn log_timing_summary(frame_logs: &[FrameLog]) {
         ("image_select", |t| t.coloring_image_select_ms),
         ("image_load", |t| t.coloring_image_load_ms),
         ("image_pose", |t| t.coloring_image_pose_ms),
+        // ("visual_alignment", |t| t.coloring_visual_alignment_ms),
         ("projection", |t| t.coloring_projection_ms),
         ("colorize", |t| t.coloring_colorize_ms),
         ("global_rgb", |t| t.coloring_global_rgb_ms),
@@ -1922,8 +2064,21 @@ mod tests {
     }
 
     #[test]
+    fn visual_alignment_is_opt_in_and_composes_with_sensor_selection() {
+        assert!(matches!(
+            parse_args(&[]).unwrap(),
+            CommandLineAction::Run(LidarModel::Mid70, false)
+        ));
+        assert!(matches!(
+            parse_args(&["--lidar", "avia", "--visual-align"]).unwrap(),
+            CommandLineAction::Run(LidarModel::Avia, true)
+        ));
+        assert!(parse_args(&["--visual-align=true"]).is_err());
+    }
+
+    #[test]
     fn command_line_defaults_to_mid70() {
-        let CommandLineAction::Run(model) = parse_args(&[]).unwrap() else {
+        let CommandLineAction::Run(model, _) = parse_args(&[]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Mid70);
@@ -1931,12 +2086,12 @@ mod tests {
 
     #[test]
     fn command_line_selects_airy96() {
-        let CommandLineAction::Run(model) = parse_args(&["--lidar", "airy96"]).unwrap() else {
+        let CommandLineAction::Run(model, _) = parse_args(&["--lidar", "airy96"]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Airy96);
 
-        let CommandLineAction::Run(model) = parse_args(&["--lidar=airy"]).unwrap() else {
+        let CommandLineAction::Run(model, _) = parse_args(&["--lidar=airy"]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Airy96);
@@ -1944,14 +2099,14 @@ mod tests {
 
     #[test]
     fn command_line_selects_avia() {
-        let CommandLineAction::Run(model) = parse_args(&["--lidar", "avia"]).unwrap() else {
+        let CommandLineAction::Run(model, _) = parse_args(&["--lidar", "avia"]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Avia);
         assert_eq!(model.input_subdir(), "avia");
         assert_eq!(model.name(), "avia");
 
-        let CommandLineAction::Run(model) = parse_args(&["--lidar=livox-avia"]).unwrap() else {
+        let CommandLineAction::Run(model, _) = parse_args(&["--lidar=livox-avia"]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Avia);
