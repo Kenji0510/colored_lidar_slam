@@ -213,6 +213,9 @@ pub struct VisualAlignmentReport {
     pub timestamp_sec: f64,
     pub status: String,
     pub applied: bool,
+    /// True after a photometric fit passes all checks, including an unchanged
+    /// pose that was already aligned. Independent of whether a delta was applied.
+    pub pose_verified: bool,
     pub reference_points: usize,
     pub visible_patches: usize,
     pub train_patches: usize,
@@ -776,6 +779,7 @@ pub struct VisualAligner {
     last_timestamp: Option<f64>,
     last_result: Option<(String, f64, VisualAlignmentResult)>,
     failures: usize,
+    has_verified_anchor: bool,
 }
 
 impl VisualAligner {
@@ -788,6 +792,7 @@ impl VisualAligner {
             last_timestamp: None,
             last_result: None,
             failures: 0,
+            has_verified_anchor: false,
         })
     }
 
@@ -840,6 +845,7 @@ impl VisualAligner {
             timestamp_sec,
             status: "bootstrap".into(),
             applied: false,
+            pose_verified: false,
             reference_points: self.references.len(),
             visible_patches: 0,
             train_patches: 0,
@@ -904,11 +910,15 @@ impl VisualAligner {
         {
             self.references.clear();
             self.failures = 0;
+            self.has_verified_anchor = false;
         }
         self.camera_signature = Some(signature);
         self.last_timestamp = Some(timestamp_sec);
         self.references
             .retain(|r| timestamp_sec - r.last_seen_sec <= self.config.max_reference_age_sec);
+        if self.references.is_empty() {
+            self.has_verified_anchor = false;
+        }
         let gray = pyramid(image, self.config.pyramid_levels);
         let depth = DepthGrid::new(geometry_world, prior, camera, &self.config);
         let grid = self.config.grid_size_px * camera.width as f64 / 960.0;
@@ -1001,14 +1011,26 @@ impl VisualAligner {
                 self.failures = 0;
             }
         }
-        let may_seed =
-            self.references.is_empty() || report.applied || report.status == "already_aligned";
+        report.pose_verified = report.applied || report.status == "already_aligned";
+        if report.pose_verified {
+            self.has_verified_anchor = true;
+        }
+        // A provisional map can need several scans to gather enough geometry
+        // and texture. Insufficient evidence is preparation, not a failed fit.
+        // Once anchored, only verified image poses may extend that same map.
+        let collecting = !self.has_verified_anchor && report.status == "insufficient_overlap";
+        if collecting {
+            report.status = "collecting_references".into();
+        }
+        let may_seed = self.references.is_empty() || report.pose_verified || collecting;
         if may_seed {
             self.failures = 0;
             // Keep a successfully tracked reference stable instead of replacing
             // every patch periodically with the uncorrected LiDAR-derived pose.
-            for &i in &active {
-                self.references[i].last_seen_sec = timestamp_sec;
+            if report.pose_verified {
+                for &i in &active {
+                    self.references[i].last_seen_sec = timestamp_sec;
+                }
             }
         }
         if !may_seed {
@@ -1016,6 +1038,7 @@ impl VisualAligner {
             if self.failures >= self.config.reset_after_failures {
                 self.references.clear();
                 self.failures = 0;
+                self.has_verified_anchor = false;
                 report.status = format!("reseeded_after_{}", report.status);
             }
         }
@@ -1962,5 +1985,133 @@ mod tests {
         }
         assert!(aligner.references.iter().any(|r| r.timestamp_sec == 1.0));
         assert!(aligner.references.iter().any(|r| r.last_seen_sec > 5.0));
+    }
+
+    #[test]
+    fn provisional_map_collects_across_scans_instead_of_resetting_below_twenty() {
+        let (full, c, _, geometry) = bootstrap();
+        let candidates: Vec<_> = full.references.iter().map(|r| r.point.clone()).collect();
+        let mut aligner = VisualAligner::new(VisualAlignmentConfig::default()).unwrap();
+        let image = render(&Matrix4::identity(), &c, 1.0, 0.0);
+        for i in 0..3 {
+            let key = format!("preparing_{i}");
+            let result = aligner
+                .process(VisualFrame {
+                    image_key: &key,
+                    timestamp_sec: 1.0 + 0.1 * i as f64,
+                    image: &image,
+                    camera: &c,
+                    camera_from_world_prior: &Matrix4::identity(),
+                    geometry_world: &geometry,
+                    new_points: &candidates[i * 8..i * 8 + 8],
+                    geometry_trusted: true,
+                })
+                .unwrap();
+            assert_eq!(
+                result.report.reference_points,
+                (i + 1) * 8,
+                "{:?}",
+                result.report
+            );
+            assert!(!result.report.pose_verified);
+            assert!(!result.report.applied);
+            assert_eq!(aligner.failures, 0);
+            assert_eq!(
+                result.report.status,
+                if i == 0 {
+                    "bootstrap"
+                } else {
+                    "collecting_references"
+                }
+            );
+        }
+        let result = aligner
+            .process(VisualFrame {
+                image_key: "ready",
+                timestamp_sec: 1.3,
+                image: &image,
+                camera: &c,
+                camera_from_world_prior: &Matrix4::identity(),
+                geometry_world: &geometry,
+                new_points: &[],
+                geometry_trusted: true,
+            })
+            .unwrap();
+        assert!(result.report.pose_verified, "{:?}", result.report);
+        assert!(aligner.has_verified_anchor);
+    }
+
+    #[test]
+    fn already_aligned_and_reused_pose_are_verified_without_applying_a_delta() {
+        let (mut aligner, c, _, geometry) = bootstrap();
+        let image = render(&Matrix4::identity(), &c, 1.0, 0.0);
+        for repeat in 0..2 {
+            let result = aligner
+                .process(VisualFrame {
+                    image_key: "same_verified_image",
+                    timestamp_sec: 1.1,
+                    image: &image,
+                    camera: &c,
+                    camera_from_world_prior: &Matrix4::identity(),
+                    geometry_world: &geometry,
+                    new_points: &[],
+                    geometry_trusted: true,
+                })
+                .unwrap();
+            assert!(result.report.pose_verified, "{:?}", result.report);
+            assert!(!result.report.applied);
+            assert_eq!(
+                result.report.status,
+                if repeat == 0 {
+                    "already_aligned"
+                } else {
+                    "reused_image"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unverified_image_cannot_extend_a_verified_reference_map() {
+        let (mut aligner, c, _, geometry) = bootstrap();
+        let image = render(&Matrix4::identity(), &c, 1.0, 0.0);
+        let established = aligner
+            .process(VisualFrame {
+                image_key: "established",
+                timestamp_sec: 1.1,
+                image: &image,
+                camera: &c,
+                camera_from_world_prior: &Matrix4::identity(),
+                geometry_world: &geometry,
+                new_points: &[],
+                geometry_trusted: true,
+            })
+            .unwrap();
+        assert!(established.report.pose_verified);
+        let count = aligner.references.len();
+        let foreground: Vec<_> = scene_points(&c, 4, 0.0)
+            .into_iter()
+            .map(|mut p| {
+                p.position_world = Point3::from(p.position_world.coords * 0.5);
+                p
+            })
+            .collect();
+        let cloud: Vec<_> = foreground.iter().map(|p| p.position_world).collect();
+        let result = aligner
+            .process(VisualFrame {
+                image_key: "lost",
+                timestamp_sec: 1.2,
+                image: &image,
+                camera: &c,
+                camera_from_world_prior: &Matrix4::identity(),
+                geometry_world: &cloud,
+                new_points: &foreground,
+                geometry_trusted: true,
+            })
+            .unwrap();
+        assert_eq!(result.report.status, "insufficient_overlap");
+        assert!(!result.report.pose_verified);
+        assert_eq!(result.report.added_points, 0);
+        assert_eq!(result.report.reference_points, count);
     }
 }

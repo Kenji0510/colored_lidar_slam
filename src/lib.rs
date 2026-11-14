@@ -12,3 +12,4 @@ pub mod voxel_map;
 pub mod voxelization;
 
 pub mod visual_alignment;
+pub mod color_quality;

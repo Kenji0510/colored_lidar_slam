@@ -7,6 +7,7 @@ use nalgebra::{Matrix3, Matrix4, Point3, Vector3};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::color_quality::{ColorQuality, should_replace_color};
 use crate::find_nearest_points::fit_plane;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -150,6 +151,7 @@ pub struct VoxelCell {
     pub rgb: Option<[u8; 3]>,
 
     pub color_observation_distance_m: Option<f64>,
+    pub color_quality: ColorQuality,
 
     // Welford法の共分散計算用の中間値
     pub m2: Matrix3<f32>,
@@ -371,6 +373,25 @@ impl LOCALMap {
         global_pose: &Matrix4<f64>,
         filter_config: &WorldMapUpdateFilterConfig,
     ) -> WorldMapUpdateStats {
+        self.update_world_map_filtered_with_rgb_quality(
+            source_points,
+            source_rgb,
+            global_pose,
+            filter_config,
+            ColorQuality::Unverified,
+        )
+    }
+
+    /// The whole frame shares one camera-pose quality. Preserve the old API
+    /// above for callers that have no image-alignment verification.
+    pub fn update_world_map_filtered_with_rgb_quality(
+        &mut self,
+        source_points: &[Point3<f32>],
+        source_rgb: Option<&[Option<ColorObservation>]>,
+        global_pose: &Matrix4<f64>,
+        filter_config: &WorldMapUpdateFilterConfig,
+        color_quality: ColorQuality,
+    ) -> WorldMapUpdateStats {
         if let Some(colors) = source_rgb {
             assert_eq!(
                 source_points.len(),
@@ -482,7 +503,7 @@ impl LOCALMap {
 
         for (key, observation) in accepted_frame_colors {
             if let Some(cell) = self.voxel_map.get_mut(&key) {
-                if cell.update_color_if_closer(observation) {
+                if cell.update_color_with_quality(observation, color_quality) {
                     updated_color_voxels += 1;
                 }
             }
@@ -1645,6 +1666,7 @@ impl VoxelCell {
             rgb: None,
 
             color_observation_distance_m: None,
+            color_quality: ColorQuality::Unverified,
 
             m2: Matrix3::zeros(),
             sample_count: 0,
@@ -1676,6 +1698,7 @@ impl VoxelCell {
             rgb: None,
 
             color_observation_distance_m: None,
+            color_quality: ColorQuality::Unverified,
 
             mean: point,
             m2: Matrix3::zeros(),
@@ -1702,24 +1725,29 @@ impl VoxelCell {
     // }
 
     pub fn update_color_if_closer(&mut self, observation: ColorObservation) -> bool {
+        self.update_color_with_quality(observation, ColorQuality::Unverified)
+    }
+
+    pub fn update_color_with_quality(
+        &mut self,
+        observation: ColorObservation,
+        quality: ColorQuality,
+    ) -> bool {
         let new_distance_m = observation.distance_m;
-
-        if !new_distance_m.is_finite() || new_distance_m <= 0.0 {
-            return false;
-        }
-
-        let should_update = self.rgb.is_none()
-            || self
-                .color_observation_distance_m
-                .map_or(true, |stored_distance_m| new_distance_m < stored_distance_m);
-
-        if !should_update {
+        if !should_replace_color(
+            self.rgb.is_some(),
+            self.color_quality,
+            self.color_observation_distance_m,
+            quality,
+            new_distance_m,
+        ) {
             return false;
         }
 
         // 色と、その色を取得した観測距離を必ず同時に更新する。
         self.rgb = Some(observation.rgb);
         self.color_observation_distance_m = Some(new_distance_m);
+        self.color_quality = quality;
 
         true
     }
@@ -2236,6 +2264,7 @@ mod tests {
 
         let stats = map.update_world_map_filtered_with_rgb(
             &[Point3::new(0.015, 0.01, 0.01)],
+            None,
             &Matrix4::<f64>::identity(),
             &world_update_filter_config(),
         );
@@ -2261,6 +2290,7 @@ mod tests {
 
         let stats = map.update_world_map_filtered_with_rgb(
             &[Point3::new(0.07, 0.01, 0.01)],
+            None,
             &Matrix4::<f64>::identity(),
             &world_update_filter_config(),
         );
@@ -2282,6 +2312,7 @@ mod tests {
 
         let stats = map.update_world_map_filtered_with_rgb(
             &[Point3::new(1.0, 0.0, 0.0)],
+            None,
             &Matrix4::<f64>::identity(),
             &world_update_filter_config(),
         );

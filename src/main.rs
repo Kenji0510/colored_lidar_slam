@@ -5,6 +5,7 @@ use re_lidar_slam::{
         CameraIntrinsics, ColorDepthMap, build_camera_from_lidar, color_image_sharpness,
         colorize_world_points, project_camera_point,
     },
+    color_quality::ColorQuality,
     deskew_points::deskew_points,
     eskf::{
         Eskf, EskfConfig, ImuModel, ImuNoise, InitialStd, NavState, STANDARD_GRAVITY_MPS2,
@@ -35,9 +36,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/11072026/01";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/01";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
-const SAVE_ROOT_DIR: &str = "data/output/11072026";
+const SAVE_ROOT_DIR: &str = "data/output/11142026";
 
 // 遮蔽の色更新ゲート。まずはこの値で確認する。
 const COLOR_OCCLUSION_MARGIN_M: f64 = 0.20;
@@ -548,7 +549,7 @@ fn main() -> Result<()> {
     let camera_from_lidar = build_camera_from_lidar(
         Vector3::new(0.01, 0.1, 0.035), // カメラ位置 [m]
         -1.0,                           // roll [deg]
-        3.0,                            // pitch [deg]
+        4.0,                            // pitch [deg]
         0.0,                            // yaw [deg]
     );
 
@@ -1214,6 +1215,7 @@ fn main() -> Result<()> {
 
         // LiDAR map geometry remains fixed. Only this image's camera pose is refined.
         let coloring_visual_alignment_start = Instant::now();
+        let mut frame_color_quality = ColorQuality::Unverified;
         if let (Some(aligner), Some(rgb_image), Some(prior), Some(metadata)) = (
             visual_aligner.as_mut(),
             selected_rgb_image.as_ref(),
@@ -1254,12 +1256,16 @@ fn main() -> Result<()> {
                 new_points: &candidates,
                 geometry_trusted,
             })?;
+            if result.report.pose_verified {
+                frame_color_quality = ColorQuality::Verified;
+            }
             log::info!(
-                "Frame {i}: visual_align={} applied={} patches={} train={} validation={} \
+                "Frame {i}: visual_align={} applied={} pose_verified={} patches={} train={} validation={} \
                  inliers={} refs={} added={} rotation={:.4} deg translation={:.4} m \
                  validation_rmse={:?}->{:?}",
                 result.report.status,
                 result.report.applied,
+                result.report.pose_verified,
                 result.report.visible_patches,
                 result.report.train_patches,
                 result.report.validation_patches,
@@ -1473,11 +1479,12 @@ fn main() -> Result<()> {
         let global_update_stats = if map_update_allowed {
             slam_map
                 .global_voxel_map
-                .update_world_map_filtered_with_rgb(
+                .update_world_map_filtered_with_rgb_quality(
                     &global_source_points,
                     global_source_rgb.as_deref(),
                     &current_frame_info.current_global_pose,
                     &world_map_update_filter_config,
+                    frame_color_quality,
                 )
         } else {
             Default::default()
@@ -1744,6 +1751,53 @@ fn main() -> Result<()> {
             planar_world_map_rgb.len(),
             planar_world_map_rgb_path,
         );
+    }
+
+    // Comparison export: only colors read with photometrically verified poses.
+    // The regular RGB map retains lower-quality fill where no verified view exists.
+    if visual_align {
+        let verified_rgb: Vec<PointXYZRGB> = slam_map
+            .global_voxel_map
+            .voxel_map
+            .values()
+            .filter(|cell| {
+                cell.sample_count >= min_samples
+                    && cell.observed_frames >= min_frames
+                    && cell.surface_status == SurfaceStatus::Planar
+                    && cell.color_quality == ColorQuality::Verified
+                    && cell.mean.coords.iter().all(|v| v.is_finite())
+            })
+            .filter_map(|cell| cell.rgb.map(|rgb| PointXYZRGB::new(cell.mean, rgb)))
+            .collect();
+        let path = format!(
+            "{}/voxel-{}_world_map_rgb_verified.pcd",
+            save_dir, GLOBAL_MAP_VOXEL_SIZE
+        );
+        log::info!(
+            "Verified RGB map: {} / {} colored planar points",
+            verified_rgb.len(),
+            planar_world_map_rgb.len()
+        );
+        if !verified_rgb.is_empty() {
+            save_pcd_xyzrgb(&verified_rgb, &path)?;
+            log::info!("Saved verified-color comparison map: {path}");
+        } else if std::path::Path::new(&path).is_file() {
+            // A previous run's comparison map must not look like this run's output.
+            std::fs::remove_file(&path)?;
+        }
+        let summary = serde_json::json!({
+            "report_version": 2,
+            "colored_planar_points": planar_world_map_rgb.len(),
+            "verified_color_points": verified_rgb.len(),
+            "unverified_color_points": planar_world_map_rgb.len() - verified_rgb.len(),
+            "image_processing_records": visual_reports.len(),
+            "verified_pose_records": visual_reports.iter().filter(|r| r.pose_verified).count(),
+            "verified_map_written": !verified_rgb.is_empty(),
+        });
+        let summary_path = std::path::Path::new(&save_dir).join("color_quality_summary.json");
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&summary_path)?);
+        serde_json::to_writer_pretty(&mut writer, &summary)?;
+        std::io::Write::flush(&mut writer)?;
     }
 
     let planar_world_map_points: Vec<Point3<f32>> = slam_map
