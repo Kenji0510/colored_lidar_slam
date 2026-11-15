@@ -2236,6 +2236,7 @@ mod tests {
 
         let stats = map.update_world_map_filtered_with_rgb(
             &[Point3::new(0.015, 0.01, 0.01)],
+            None,
             &Matrix4::<f64>::identity(),
             &world_update_filter_config(),
         );
@@ -2261,6 +2262,7 @@ mod tests {
 
         let stats = map.update_world_map_filtered_with_rgb(
             &[Point3::new(0.07, 0.01, 0.01)],
+            None,
             &Matrix4::<f64>::identity(),
             &world_update_filter_config(),
         );
@@ -2282,6 +2284,7 @@ mod tests {
 
         let stats = map.update_world_map_filtered_with_rgb(
             &[Point3::new(1.0, 0.0, 0.0)],
+            None,
             &Matrix4::<f64>::identity(),
             &world_update_filter_config(),
         );

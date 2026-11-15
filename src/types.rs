@@ -97,6 +97,8 @@ pub struct FrameTiming {
     pub downsample_ms: f64,
     pub build_source_maps_ms: f64,
     pub icp_ms: f64,
+    /// Grayscale conversion, direct image alignment and reference patch updates.
+    pub visual_alignment_ms: f64,
     pub pose_update_ms: f64,
     pub global_filter_ms: f64,
     pub global_map_update_ms: f64,
@@ -128,6 +130,44 @@ pub struct FrameTiming {
     pub coloring_colorize_ms: f64,
     /// Time spent sampling image colors for the GlobalMap input points.
     pub coloring_global_rgb_ms: f64,
+}
+
+/// Image-only diagnostics. ICP quality fields retain their pre-visual meaning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisualAlignmentLog {
+    pub status: String,
+    pub update_applied: bool,
+    pub matched_patches: usize,
+    pub residual_pixels: usize,
+    pub iterations: usize,
+    /// Zero-mean patch RMSE on grayscale values in 0..255.
+    pub initial_rmse: Option<f64>,
+    pub final_rmse: Option<f64>,
+    pub translation_correction_m: f64,
+    pub rotation_correction_deg: f64,
+    pub new_landmarks: usize,
+    pub refreshed_landmarks: usize,
+    pub landmarks: usize,
+}
+
+impl Default for VisualAlignmentLog {
+    fn default() -> Self {
+        Self {
+            status: "not_run".into(),
+            update_applied: false,
+            matched_patches: 0,
+            residual_pixels: 0,
+            iterations: 0,
+            initial_rmse: None,
+            final_rmse: None,
+            translation_correction_m: 0.0,
+            rotation_correction_deg: 0.0,
+            new_landmarks: 0,
+            refreshed_landmarks: 0,
+            landmarks: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +203,8 @@ pub struct FrameLog {
     pub pose_z: f64,
     #[serde(default)]
     pub timing: FrameTiming,
+    #[serde(default)]
+    pub visual_alignment: VisualAlignmentLog,
     /// ESKF の LiDAR 更新を採用したか（false なら IMU 予測のみ）。
     #[serde(default)]
     pub eskf_update_applied: bool,

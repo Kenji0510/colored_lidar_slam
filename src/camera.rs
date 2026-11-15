@@ -1,4 +1,4 @@
-use nalgebra::{Matrix3, Matrix4, Point3, Rotation3, Vector3};
+use nalgebra::{Matrix2, Matrix3, Matrix4, Point3, Rotation3, SMatrix, Vector2, Vector3};
 
 use crate::types::ColoredPoint;
 
@@ -35,6 +35,85 @@ pub fn build_camera_from_lidar(
         .copy_from(&translation);
 
     transform
+}
+
+/// Brown-Conrady distortion and its analytic derivative in normalized coordinates.
+fn distort_with_jacobian(x: f64, y: f64, d: [f64; 5]) -> (Vector2<f64>, Matrix2<f64>) {
+    let [k1, k2, p1, p2, k3] = d;
+    let r2 = x * x + y * y;
+    let radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2;
+    let slope = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r2 * r2;
+    let rx = 2.0 * x * slope;
+    let ry = 2.0 * y * slope;
+    let distorted = Vector2::new(
+        x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x),
+        y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y,
+    );
+    let jacobian = Matrix2::new(
+        radial + x * rx + 2.0 * p1 * y + 6.0 * p2 * x,
+        x * ry + 2.0 * p1 * x + 2.0 * p2 * y,
+        y * rx + 2.0 * p1 * x + 2.0 * p2 * y,
+        radial + y * ry + 6.0 * p1 * y + 2.0 * p2 * x,
+    );
+    (distorted, jacobian)
+}
+
+/// Subpixel projection for direct alignment. This does not apply the RGB
+/// central-75% crop: callers validate the entire patch against image bounds.
+pub fn project_camera_point_subpixel(
+    point: &Point3<f64>,
+    camera: &CameraIntrinsics,
+) -> Option<(Vector2<f64>, SMatrix<f64, 2, 3>)> {
+    if !point.coords.iter().all(|v| v.is_finite()) || point.z <= 1e-6 {
+        return None;
+    }
+    let z_inv = 1.0 / point.z;
+    let x = point.x * z_inv;
+    let y = point.y * z_inv;
+    let (d, jd) = distort_with_jacobian(x, y, camera.distortion);
+    let pixel = Vector2::new(camera.fx * d.x + camera.cx, camera.fy * d.y + camera.cy);
+    let normalized_jacobian =
+        SMatrix::<f64, 2, 3>::new(z_inv, 0.0, -x * z_inv, 0.0, z_inv, -y * z_inv);
+    let projection_jacobian =
+        Matrix2::new(camera.fx, 0.0, 0.0, camera.fy) * jd * normalized_jacobian;
+    (pixel
+        .iter()
+        .chain(projection_jacobian.iter())
+        .all(|v| v.is_finite()))
+    .then_some((pixel, projection_jacobian))
+}
+
+/// Invert Brown-Conrady distortion, then place the pixel at optical-axis depth Z.
+/// Used for the constant-depth approximation of the 9x9 reference patch.
+pub fn unproject_pixel_at_depth(
+    pixel: &Vector2<f64>,
+    depth: f64,
+    camera: &CameraIntrinsics,
+) -> Option<Point3<f64>> {
+    if !depth.is_finite() || depth <= 1e-6 || camera.fx <= 0.0 || camera.fy <= 0.0 {
+        return None;
+    }
+    let target = Vector2::new(
+        (pixel.x - camera.cx) / camera.fx,
+        (pixel.y - camera.cy) / camera.fy,
+    );
+    let mut xy = target;
+    for _ in 0..15 {
+        let (distorted, jacobian) = distort_with_jacobian(xy.x, xy.y, camera.distortion);
+        let residual = distorted - target;
+        if residual.norm_squared() < 1e-24 {
+            break;
+        }
+        xy -= jacobian.try_inverse()? * residual;
+        if !xy.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+    }
+    let (distorted, _) = distort_with_jacobian(xy.x, xy.y, camera.distortion);
+    if (distorted - target).norm() > 1e-8 {
+        return None;
+    }
+    Some(Point3::new(xy.x * depth, xy.y * depth, depth))
 }
 
 #[derive(Debug, Clone)]

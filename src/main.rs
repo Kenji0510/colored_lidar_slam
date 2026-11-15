@@ -19,7 +19,11 @@ use re_lidar_slam::{
         solve_icp_delta_observable,
     },
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory},
-    types::{CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap},
+    types::{
+        CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap,
+        VisualAlignmentLog,
+    },
+    visual_alignment::{VisualAligner, VisualAlignmentConfig},
     voxel_map::{
         ColorObservation, LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus,
         WorldMapUpdateFilterConfig,
@@ -31,7 +35,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/01";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/02";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
 const SAVE_ROOT_DIR: &str = "data/output/11142026";
 
@@ -92,7 +96,7 @@ impl LidarModel {
 }
 
 enum CommandLineAction {
-    Run(LidarModel),
+    Run(LidarModel, bool),
     Help,
 }
 
@@ -101,6 +105,7 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut lidar_model = LidarModel::Mid70;
+    let mut visual_alignment_enabled = true;
     let mut args = args.into_iter();
 
     while let Some(argument) = args.next() {
@@ -110,6 +115,7 @@ where
 
         match argument.as_str() {
             "-h" | "--help" => return Ok(CommandLineAction::Help),
+            "--no-visual-alignment" => visual_alignment_enabled = false,
             "--lidar" => {
                 let value = args
                     .next()
@@ -127,12 +133,16 @@ where
         }
     }
 
-    Ok(CommandLineAction::Run(lidar_model))
+    Ok(CommandLineAction::Run(
+        lidar_model,
+        visual_alignment_enabled,
+    ))
 }
 
 fn print_usage() {
-    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>]");
+    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>] [--no-visual-alignment]");
     println!("  --lidar  Select the point-cloud sensor (default: mid70)");
+    println!("  --no-visual-alignment  Disable the grayscale 9x9 visual ESIKF update");
 }
 
 // Mid-70 sparse-cloud preset.
@@ -364,13 +374,14 @@ fn count_imu_samples_in_time_range(imu_data: &[IMU], start_time: f64, end_time: 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
-    let lidar_model = match parse_command_line(std::env::args_os().skip(1))? {
-        CommandLineAction::Run(lidar_model) => lidar_model,
-        CommandLineAction::Help => {
-            print_usage();
-            return Ok(());
-        }
-    };
+    let (lidar_model, visual_alignment_enabled) =
+        match parse_command_line(std::env::args_os().skip(1))? {
+            CommandLineAction::Run(lidar_model, enabled) => (lidar_model, enabled),
+            CommandLineAction::Help => {
+                print_usage();
+                return Ok(());
+            }
+        };
     let load_dir = format!("{DATASET_DIR}/{}", lidar_model.input_subdir());
     let save_dir = format!("{SAVE_ROOT_DIR}/{}", lidar_model.name());
     let imu_to_lidar = lidar_model.imu_to_lidar_rotation();
@@ -467,12 +478,13 @@ fn main() -> Result<()> {
 
     let mut prev_frame_start_time: f64 = 0.0;
     let mut frame_logs: Vec<FrameLog> = Vec::new();
+    let mut visual_aligner = VisualAligner::new(VisualAlignmentConfig::default());
 
     let camera_from_lidar = build_camera_from_lidar(
         Vector3::new(0.01, 0.2, 0.035), // カメラ位置 [m]
         -1.0,                           // roll [deg]
-        1.5,                          // pitch [deg]
-        0.0,                          // yaw [deg]
+        -0.5,                            // pitch [deg]
+        -1.0,                            // yaw [deg]
     );
 
     //
@@ -1027,6 +1039,60 @@ fn main() -> Result<()> {
         );
         // --- ICP (Point to Plane) ---
 
+        // ICP diagnostics describe the accepted LiDAR solution, before visual refinement.
+        let (icp_translation_correction_m, icp_rotation_correction_deg) = if icp_ok {
+            pose_correction_magnitudes(&pred_r, &pred_t, &r_mat, &t_vec)
+        } else {
+            (0.0, 0.0)
+        };
+        let map_update_allowed = local_map_was_empty || icp_ok;
+
+        // --- Direct image alignment: fixed historical 9x9 patches -> current image ---
+        // The image residual is evaluated at the image timestamp, but its Jacobian
+        // updates the 15D ESKF state at the LiDAR FRAME START. All following users
+        // (RGB projection, local/global registration, next IMU prediction) see it.
+        let visual_alignment_start = Instant::now();
+        let mut visual_alignment_log = VisualAlignmentLog::default();
+        if !visual_alignment_enabled {
+            visual_alignment_log.status = "disabled".into();
+        } else if !map_update_allowed {
+            visual_alignment_log.status = "lidar_rejected".into();
+        } else if let (Some(metadata), Some(rgb)) = (selected_image, selected_rgb_image.as_ref()) {
+            let camera = CameraIntrinsics::for_image_size(rgb.width(), rgb.height())?;
+            visual_alignment_log = visual_aligner.process_frame(
+                filter,
+                &imu_data,
+                current_frame_start_time,
+                metadata.timestamp_sec,
+                i as u64,
+                rgb,
+                &camera,
+                &camera_from_lidar,
+                &downsampled_source_points_for_local,
+            );
+        } else {
+            visual_alignment_log.status = "no_image".into();
+        }
+        let visual_alignment_time = visual_alignment_start.elapsed();
+        log::info!(
+            "Frame {i}: visual status={} applied={} patches={} rmse={:?}->{:?} \
+             delta_t={:.4} m delta_r={:.4} deg refs={} added={} time={:.3} ms",
+            visual_alignment_log.status,
+            visual_alignment_log.update_applied,
+            visual_alignment_log.matched_patches,
+            visual_alignment_log.initial_rmse,
+            visual_alignment_log.final_rmse,
+            visual_alignment_log.translation_correction_m,
+            visual_alignment_log.rotation_correction_deg,
+            visual_alignment_log.landmarks,
+            visual_alignment_log.new_landmarks,
+            duration_ms(visual_alignment_time),
+        );
+        // Keep geometric filtering and map insertion at the SAME final pose.
+        let final_lidar_pose = filter.lidar_pose().cast::<f32>();
+        r_mat = final_lidar_pose.fixed_view::<3, 3>(0, 0).into_owned();
+        t_vec = final_lidar_pose.fixed_view::<3, 1>(0, 3).into_owned();
+
         // --- Update current frame info ---
         let pose_update_start = Instant::now();
         let prev_pos = current_frame_info
@@ -1184,12 +1250,7 @@ fn main() -> Result<()> {
             .clamp(-1.0, 1.0)
             .acos()
             .to_degrees();
-        let (icp_translation_correction_m, icp_rotation_correction_deg) = if icp_ok {
-            pose_correction_magnitudes(&pred_r, &pred_t, &r_mat, &t_vec)
-        } else {
-            (0.0, 0.0)
-        };
-        let map_update_allowed = local_map_was_empty || icp_ok;
+
         // --- Record frame log ---
         // Coloring is reported separately, so pose_update covers only the pose
         // state update and the frame-log bookkeeping around it.
@@ -1355,6 +1416,7 @@ fn main() -> Result<()> {
             downsample_ms: duration_ms(voxel_end),
             build_source_maps_ms: duration_ms(build_map_end),
             icp_ms: duration_ms(loop_end),
+            visual_alignment_ms: duration_ms(visual_alignment_time),
             pose_update_ms: duration_ms(pose_update_time),
             global_filter_ms: duration_ms(global_filter_time),
             global_map_update_ms: duration_ms(global_map_update_time),
@@ -1438,6 +1500,7 @@ fn main() -> Result<()> {
             pose_y: new_pos.y,
             pose_z: new_pos.z,
             timing,
+            visual_alignment: visual_alignment_log,
             eskf_update_applied,
             gyro_bias_radps: filter.state.bg.into(),
             accel_bias_mps2: filter.state.ba.into(),
@@ -1497,6 +1560,39 @@ fn main() -> Result<()> {
         world_map_points_before_plane_filter_xyz.len(),
         world_map_before_plane_filter_path,
     );
+
+    // 平面処理前の色付き点群: before_plane_filter と同じセル条件で、色を持つセルだけを保存する。
+    let world_map_rgb_before_plane_filter: Vec<PointXYZRGB> = slam_map
+        .global_voxel_map
+        .voxel_map
+        .values()
+        .filter(|cell| {
+            cell.sample_count >= min_samples
+                && cell.observed_frames >= min_frames
+                && cell.mean.coords.iter().all(|value| value.is_finite())
+        })
+        .filter_map(|cell| cell.rgb.map(|rgb| PointXYZRGB::new(cell.mean, rgb)))
+        .collect();
+
+    let world_map_rgb_before_plane_filter_path = format!(
+        "{}/voxel-{}_world_map_rgb_before_plane_filter.pcd",
+        save_dir, GLOBAL_MAP_VOXEL_SIZE,
+    );
+
+    if world_map_rgb_before_plane_filter.is_empty() {
+        log::info!("RGB export before plane filter skipped: no colored points");
+    } else {
+        save_pcd_xyzrgb(
+            &world_map_rgb_before_plane_filter,
+            &world_map_rgb_before_plane_filter_path,
+        )?;
+        log::info!(
+            "Saved colored world map before plane filter: {} / {} points → {}",
+            world_map_rgb_before_plane_filter.len(),
+            world_map_points_before_plane_filter.len(),
+            world_map_rgb_before_plane_filter_path,
+        );
+    }
 
     // 終端処理: 遅延キューの状態に依存せず、現在の全累積点で全セルを再判定する。
     let final_surface_start = Instant::now();
@@ -1609,7 +1705,7 @@ fn log_timing_summary(frame_logs: &[FrameLog]) {
         return;
     }
 
-    let stages: [(&str, fn(&FrameTiming) -> f64); 14] = [
+    let stages: [(&str, fn(&FrameTiming) -> f64); 15] = [
         ("load_pcd", |t| t.load_pcd_ms),
         ("timestamps", |t| t.timestamps_ms),
         ("imu_predict", |t| t.imu_predict_ms),
@@ -1618,6 +1714,7 @@ fn log_timing_summary(frame_logs: &[FrameLog]) {
         ("downsample", |t| t.downsample_ms),
         ("build_source_maps", |t| t.build_source_maps_ms),
         ("icp", |t| t.icp_ms),
+        ("visual_alignment", |t| t.visual_alignment_ms),
         ("pose_update", |t| t.pose_update_ms),
         ("global_filter", |t| t.global_filter_ms),
         ("global_map_update", |t| t.global_map_update_ms),
@@ -1860,20 +1957,32 @@ mod tests {
 
     #[test]
     fn command_line_defaults_to_mid70() {
-        let CommandLineAction::Run(model) = parse_args(&[]).unwrap() else {
+        let CommandLineAction::Run(model, enabled) = parse_args(&[]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Mid70);
+        assert!(enabled);
+    }
+
+    #[test]
+    fn command_line_can_disable_visual_alignment_for_comparison() {
+        let CommandLineAction::Run(model, enabled) =
+            parse_args(&["--lidar", "avia", "--no-visual-alignment"]).unwrap()
+        else {
+            panic!("expected run action");
+        };
+        assert_eq!(model, LidarModel::Avia);
+        assert!(!enabled);
     }
 
     #[test]
     fn command_line_selects_airy96() {
-        let CommandLineAction::Run(model) = parse_args(&["--lidar", "airy96"]).unwrap() else {
+        let CommandLineAction::Run(model, _) = parse_args(&["--lidar", "airy96"]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Airy96);
 
-        let CommandLineAction::Run(model) = parse_args(&["--lidar=airy"]).unwrap() else {
+        let CommandLineAction::Run(model, _) = parse_args(&["--lidar=airy"]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Airy96);
@@ -1881,14 +1990,14 @@ mod tests {
 
     #[test]
     fn command_line_selects_avia() {
-        let CommandLineAction::Run(model) = parse_args(&["--lidar", "avia"]).unwrap() else {
+        let CommandLineAction::Run(model, _) = parse_args(&["--lidar", "avia"]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Avia);
         assert_eq!(model.input_subdir(), "avia");
         assert_eq!(model.name(), "avia");
 
-        let CommandLineAction::Run(model) = parse_args(&["--lidar=livox-avia"]).unwrap() else {
+        let CommandLineAction::Run(model, _) = parse_args(&["--lidar=livox-avia"]).unwrap() else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Avia);
