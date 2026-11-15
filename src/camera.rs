@@ -13,8 +13,9 @@ pub fn build_camera_from_lidar(
     pitch_deg: f64,
     yaw_deg: f64,
 ) -> Matrix4<f64> {
-    // 以前の着色コードと同じ軸変換。
-    let r_nominal = Matrix3::<f64>::new(0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0);
+    // LiDAR(x前・y左・z上) → カメラ(x右・y下・z前) の標準的な軸変換。
+    // x_cam = -y_lidar, y_cam = -z_lidar, z_cam = x_lidar (画像の反転なし)
+    let r_nominal = Matrix3::<f64>::new(0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0);
 
     let camera_mount = Rotation3::from_euler_angles(
         roll_deg.to_radians(),
@@ -59,11 +60,11 @@ impl CameraIntrinsics {
         Ok(Self {
             width,
             height,
-            fx: 1282.49623 * scale,
-            fy: 1287.95761 * scale,
-            cx: 928.79093 * scale,
-            cy: 671.31092 * scale,
-            distortion: [-0.040856, -0.004680, 0.010953, -0.002704, 0.0],
+            fx: 1175.01946 * scale,
+            fy: 1177.56737 * scale,
+            cx: 939.43935 * scale,
+            cy: 627.06837 * scale,
+            distortion: [-0.136349, 0.028462, -0.002188, 0.001479, 0.0],
         })
     }
 }

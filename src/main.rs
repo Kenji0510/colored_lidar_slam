@@ -31,9 +31,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/10042026/02";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/01";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
-const SAVE_ROOT_DIR: &str = "data/output/10042026";
+const SAVE_ROOT_DIR: &str = "data/output/11142026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LidarModel {
@@ -469,10 +469,10 @@ fn main() -> Result<()> {
     let mut frame_logs: Vec<FrameLog> = Vec::new();
 
     let camera_from_lidar = build_camera_from_lidar(
-        Vector3::new(0.04, 0.0, 0.05), // カメラ位置 [m]
-        0.0,                           // roll [deg]
-        -1.8,                          // pitch [deg]
-        -2.2,                          // yaw [deg]
+        Vector3::new(0.01, 0.2, 0.035), // カメラ位置 [m]
+        -1.0,                           // roll [deg]
+        1.5,                          // pitch [deg]
+        0.0,                          // yaw [deg]
     );
 
     //
