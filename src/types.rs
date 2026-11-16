@@ -99,6 +99,11 @@ pub struct FrameTiming {
     pub icp_ms: f64,
     /// Grayscale conversion, direct image alignment and reference patch updates.
     pub visual_alignment_ms: f64,
+    /// Image metadata/quality capture plus scheduled region RGB reprojection.
+    pub regional_recolor_ms: f64,
+    /// Diagnostic RGB map collection, PCD and sidecar JSON writing. Separate
+    /// from regional_recolor_ms so file I/O does not look like alignment cost.
+    pub recolor_snapshot_ms: f64,
     pub pose_update_ms: f64,
     pub global_filter_ms: f64,
     pub global_map_update_ms: f64,
@@ -106,7 +111,7 @@ pub struct FrameTiming {
     pub local_map_update_ms: f64,
     /// Total time spent coloring the registered frame (sum of `coloring_*`).
     pub coloring_ms: f64,
-    /// Per-frame processing time excluding PCD file I/O.
+    /// Per-frame processing excluding input PCD loading; includes snapshot I/O.
     pub processing_total_ms: f64,
     /// Per-frame wall time including PCD file I/O.
     pub total_with_file_io_ms: f64,
@@ -130,6 +135,17 @@ pub struct FrameTiming {
     pub coloring_colorize_ms: f64,
     /// Time spent sampling image colors for the GlobalMap input points.
     pub coloring_global_rgb_ms: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecolorSnapshotLog {
+    pub attempted: bool,
+    pub saved: bool,
+    pub point_count: usize,
+    pub pcd_path: Option<String>,
+    pub metadata_path: Option<String>,
+    pub error: Option<String>,
 }
 
 /// Image-only diagnostics. ICP quality fields retain their pre-visual meaning.
@@ -205,6 +221,10 @@ pub struct FrameLog {
     pub timing: FrameTiming,
     #[serde(default)]
     pub visual_alignment: VisualAlignmentLog,
+    #[serde(default)]
+    pub regional_recolor: crate::map_recolor::MapRecolorLog,
+    #[serde(default)]
+    pub recolor_snapshot: RecolorSnapshotLog,
     /// ESKF の LiDAR 更新を採用したか（false なら IMU 予測のみ）。
     #[serde(default)]
     pub eskf_update_applied: bool,
@@ -260,6 +280,8 @@ mod tests {
         assert_eq!(log.observable_rank, 0);
         assert!(!log.map_updated);
         assert_eq!(log.timing.processing_total_ms, 0.0);
+        assert_eq!(log.timing.recolor_snapshot_ms, 0.0);
+        assert!(!log.recolor_snapshot.attempted);
     }
 }
 

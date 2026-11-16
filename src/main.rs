@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use nalgebra::{Matrix3, Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
 use re_lidar_slam::{
     camera::{
@@ -18,26 +18,234 @@ use re_lidar_slam::{
         Vector6f, build_robust_point_to_plane_system, compute_rmse, compute_robust_cost,
         solve_icp_delta_observable,
     },
+    map_recolor::{MapRecolorConfig, MapRecolorLog, MapRecolorer, MapRegionSource},
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory},
     types::{
-        CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap,
-        VisualAlignmentLog,
+        CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, RecolorSnapshotLog,
+        SLAMMap, VisualAlignmentLog,
     },
     visual_alignment::{VisualAligner, VisualAlignmentConfig},
     voxel_map::{
-        ColorObservation, LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus,
-        WorldMapUpdateFilterConfig,
+        LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus, WorldMapUpdateFilterConfig,
     },
     voxelization::{voxel_downsample_points, voxel_downsample_points_and_maps_dual},
 };
 use std::{
     ffi::OsString,
-    time::{Duration, Instant},
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/02";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/01";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
 const SAVE_ROOT_DIR: &str = "data/output/11142026";
+/// Diagnostic exports follow MapRecolorConfig::update_every_frames automatically.
+const SAVE_RECOLOR_SNAPSHOTS: bool = true;
+
+#[derive(Clone, Copy)]
+enum SnapshotPhase {
+    AfterRecolor,
+    FinalFlush,
+}
+
+impl SnapshotPhase {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::AfterRecolor => "after",
+            Self::FinalFlush => "final",
+        }
+    }
+}
+
+struct SnapshotContext<'a> {
+    phase: SnapshotPhase,
+    input_frame_index: Option<usize>,
+    timestamp_sec: Option<f64>,
+    recolor: &'a MapRecolorLog,
+    region_sources: &'a [MapRegionSource],
+}
+
+#[derive(serde::Serialize)]
+struct SnapshotMetadata<'a> {
+    completed_frames: u64,
+    input_frame_index: Option<usize>,
+    timestamp_sec: Option<f64>,
+    phase: &'static str,
+    point_count: usize,
+    total_map_voxels: usize,
+    min_samples: u64,
+    min_observed_frames: u64,
+    surface_filter_applied: bool,
+    pcd_file: Option<String>,
+    status: &'static str,
+    collection_ms: f64,
+    pcd_write_ms: f64,
+    regional_recolor: &'a MapRecolorLog,
+    region_sources: &'a [MapRegionSource],
+}
+
+struct RecolorSnapshotWriter {
+    directory: PathBuf,
+}
+
+impl RecolorSnapshotWriter {
+    fn new(save_dir: &Path) -> Result<Self> {
+        let parent = save_dir.join("recolor_snapshots");
+        std::fs::create_dir_all(&parent).with_context(|| format!("create {}", parent.display()))?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let prefix = format!(
+            "run_{}_{:09}_{}",
+            now.as_secs(),
+            now.subsec_nanos(),
+            std::process::id()
+        );
+        for attempt in 0..1000 {
+            let directory = parent.join(format!("{prefix}_{attempt:03}"));
+            match std::fs::create_dir(&directory) {
+                Ok(()) => {
+                    log::info!("Recolor snapshots: {}", directory.display());
+                    return Ok(Self { directory });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("create {}", directory.display()));
+                }
+            }
+        }
+        bail!("cannot create a unique recolor snapshot directory")
+    }
+
+    fn save(&self, map: &LOCALMap, context: SnapshotContext<'_>) -> Result<RecolorSnapshotLog> {
+        // Match the existing export call's Vec/String arguments. This supports
+        // projects whose helper takes either slices/&str or Vec/String refs.
+        self.save_with(map, context, |points, path| {
+            save_pcd_xyzrgb(points, &path.to_owned())
+        })
+    }
+
+    fn save_with<F>(
+        &self,
+        map: &LOCALMap,
+        context: SnapshotContext<'_>,
+        write_pcd: F,
+    ) -> Result<RecolorSnapshotLog>
+    where
+        F: FnOnce(&Vec<PointXYZRGB>, &str) -> Result<()>,
+    {
+        let stem = format!(
+            "frame_{:06}_{}",
+            context.recolor.completed_frames,
+            context.phase.suffix()
+        );
+        let pcd_path = self.directory.join(format!("{stem}.pcd"));
+        let metadata_path = self.directory.join(format!("{stem}.json"));
+        anyhow::ensure!(
+            !pcd_path.exists() && !metadata_path.exists(),
+            "snapshot already exists: {stem}"
+        );
+        let temporary_pcd = self.directory.join(format!(".{stem}.partial.pcd"));
+        let temporary_json = self.directory.join(format!(".{stem}.partial.json"));
+        let collection_start = Instant::now();
+        // Same criteria as the final RGB export before the planar-only filter.
+        // Never run extra plane fitting or recoloring just to make a snapshot.
+        let points = collect_colored_world_map(map, false);
+        let collection_ms = duration_ms(collection_start.elapsed());
+        let result = (|| {
+            let pcd_start = Instant::now();
+            if !points.is_empty() {
+                write_pcd(
+                    &points,
+                    temporary_pcd
+                        .to_str()
+                        .context("snapshot path is not UTF-8")?,
+                )
+                .with_context(|| format!("write {}", pcd_path.display()))?;
+            }
+            let pcd_write_ms = duration_ms(pcd_start.elapsed());
+            let metadata = SnapshotMetadata {
+                completed_frames: context.recolor.completed_frames,
+                input_frame_index: context.input_frame_index,
+                timestamp_sec: context.timestamp_sec.filter(|t| t.is_finite()),
+                phase: context.phase.suffix(),
+                point_count: points.len(),
+                total_map_voxels: map.voxel_map.len(),
+                min_samples: map.config.min_points_per_voxel as u64,
+                min_observed_frames: map.config.min_observed_frames_per_voxel as u64,
+                surface_filter_applied: false,
+                pcd_file: (!points.is_empty()).then(|| format!("{stem}.pcd")),
+                status: if points.is_empty() { "empty" } else { "saved" },
+                collection_ms,
+                pcd_write_ms,
+                regional_recolor: context.recolor,
+                region_sources: context.region_sources,
+            };
+            std::fs::write(&temporary_json, serde_json::to_vec_pretty(&metadata)?)?;
+            if !points.is_empty() {
+                std::fs::rename(&temporary_pcd, &pcd_path)?;
+            }
+            std::fs::rename(&temporary_json, &metadata_path)?;
+            log::info!(
+                "Recolor snapshot: frame={} phase={} points={} pcd={} metadata={}",
+                context.recolor.completed_frames,
+                context.phase.suffix(),
+                points.len(),
+                if points.is_empty() {
+                    "(empty)".to_owned()
+                } else {
+                    pcd_path.display().to_string()
+                },
+                metadata_path.display()
+            );
+            Ok(RecolorSnapshotLog {
+                attempted: true,
+                saved: !points.is_empty(),
+                point_count: points.len(),
+                pcd_path: (!points.is_empty()).then(|| pcd_path.display().to_string()),
+                metadata_path: Some(metadata_path.display().to_string()),
+                error: None,
+            })
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary_pcd);
+            let _ = std::fs::remove_file(&temporary_json);
+        }
+        result
+    }
+}
+
+fn collect_colored_world_map(map: &LOCALMap, planar_only: bool) -> Vec<PointXYZRGB> {
+    map.voxel_map
+        .values()
+        .filter(|cell| {
+            cell.sample_count >= map.config.min_points_per_voxel as u64
+                && cell.observed_frames >= map.config.min_observed_frames_per_voxel as u64
+                && (!planar_only || cell.surface_status == SurfaceStatus::Planar)
+                && cell.mean.coords.iter().all(|v| v.is_finite())
+        })
+        .filter_map(|cell| cell.rgb.map(|rgb| PointXYZRGB::new(cell.mean, rgb)))
+        .collect()
+}
+
+fn try_save_recolor_snapshot(
+    writer: &RecolorSnapshotWriter,
+    map: &LOCALMap,
+    context: SnapshotContext<'_>,
+) -> RecolorSnapshotLog {
+    let frames = context.recolor.completed_frames;
+    let phase = context.phase.suffix();
+    match writer.save(map, context) {
+        Ok(report) => report,
+        Err(error) => {
+            let error = format!("snapshot frame {frames} phase {phase}: {error:#}");
+            log::warn!("{error}");
+            RecolorSnapshotLog {
+                attempted: true,
+                error: Some(error),
+                ..Default::default()
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LidarModel {
@@ -479,12 +687,19 @@ fn main() -> Result<()> {
     let mut prev_frame_start_time: f64 = 0.0;
     let mut frame_logs: Vec<FrameLog> = Vec::new();
     let mut visual_aligner = VisualAligner::new(VisualAlignmentConfig::default());
+    // 1 m regions, updated at completed LiDAR frames 30, 60, 90, ...
+    let mut map_recolorer = MapRecolorer::new(MapRecolorConfig::default());
+    let snapshot_writer = if SAVE_RECOLOR_SNAPSHOTS {
+        Some(RecolorSnapshotWriter::new(Path::new(&save_dir))?)
+    } else {
+        None
+    };
 
     let camera_from_lidar = build_camera_from_lidar(
         Vector3::new(0.01, 0.2, 0.035), // カメラ位置 [m]
         -1.0,                           // roll [deg]
-        -0.5,                            // pitch [deg]
-        -1.0,                            // yaw [deg]
+        -0.5,                           // pitch [deg]
+        -1.0,                           // yaw [deg]
     );
 
     //
@@ -1289,55 +1504,10 @@ fn main() -> Result<()> {
         };
         let global_filter_time = global_filter_start.elapsed();
 
-        let coloring_global_rgb_start = Instant::now();
-        let global_source_rgb: Option<Vec<Option<ColorObservation>>> = match (
-            map_update_allowed,
-            selected_rgb_image.as_ref(),
-            camera_from_world_at_image.as_ref(),
-        ) {
-            (true, Some(rgb_image), Some(camera_from_world)) => {
-                let intrinsics =
-                    CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
-
-                // LiDARフレーム開始時の座標 → 画像撮影時のカメラ座標
-                let camera_from_lidar_start =
-                    camera_from_world * current_frame_info.current_global_pose;
-
-                let colors: Vec<Option<ColorObservation>> = global_source_points
-                    .iter()
-                    .map(|point| {
-                        let camera_point =
-                            camera_from_lidar_start.transform_point(&point.cast::<f64>());
-
-                        let (u, v) = project_camera_point(&camera_point, &intrinsics)?;
-
-                        let rgb = rgb_image.get_pixel_checked(u, v)?.0;
-
-                        // カメラ座標の原点は、画像撮影時のカメラ位置。
-                        // この点の長さが、カメラから対象点までの距離になる。
-                        let distance_m = camera_point.coords.norm();
-
-                        if !distance_m.is_finite() || distance_m <= 0.0 {
-                            return None;
-                        }
-
-                        Some(ColorObservation { rgb, distance_m })
-                    })
-                    .collect();
-
-                let colored_count = colors.iter().filter(|color| color.is_some()).count();
-
-                log::debug!(
-                    "Frame {i}: GlobalMap input RGB: {} / {} points",
-                    colored_count,
-                    global_source_points.len(),
-                );
-
-                Some(colors)
-            }
-            _ => None,
-        };
-        let coloring_global_rgb_time = coloring_global_rgb_start.elapsed();
+        // GlobalMap RGB is assigned AFTER geometry accumulation, per region.
+        // Per-scan closest-distance colors must not overwrite a region's source.
+        // Keep the old timing field for compatibility with earlier JSON readers.
+        let coloring_global_rgb_time = Duration::ZERO;
 
         let global_map_update_start = Instant::now();
         let global_update_stats = if map_update_allowed {
@@ -1345,7 +1515,7 @@ fn main() -> Result<()> {
                 .global_voxel_map
                 .update_world_map_filtered_with_rgb(
                     &global_source_points,
-                    global_source_rgb.as_deref(),
+                    None,
                     &current_frame_info.current_global_pose,
                     &world_map_update_filter_config,
                 )
@@ -1353,6 +1523,26 @@ fn main() -> Result<()> {
             Default::default()
         };
         let global_map_update_time = global_map_update_start.elapsed();
+        let recolor_capture_start = Instant::now();
+        if map_update_allowed {
+            map_recolorer.note_map_update(&slam_map.global_voxel_map);
+            if let (Some(metadata), Some(rgb), Some(camera_from_world)) = (
+                selected_image,
+                selected_rgb_image.as_ref(),
+                camera_from_world_at_image.as_ref(),
+            ) {
+                let camera = CameraIntrinsics::for_image_size(rgb.width(), rgb.height())?;
+                let image_path = std::path::Path::new(&image_meta_dir).join(&metadata.file_name);
+                map_recolorer.observe_image(
+                    metadata.timestamp_sec,
+                    &image_path,
+                    rgb,
+                    &camera,
+                    camera_from_world,
+                );
+            }
+        }
+        let recolor_capture_time = recolor_capture_start.elapsed();
         log::debug!(
             "Frame {i}: GlobalMap update input={}, provisional={}, projected={}, \
              pending={}, pending_voxels={}, non_finite={}",
@@ -1394,6 +1584,66 @@ fn main() -> Result<()> {
         let local_map_update_time = local_map_update_start.elapsed();
         // --- Update the LocalMap with the new frame's points ---
 
+        // Visual alignment still runs every frame. RGB map updates run every 30
+        // completed LiDAR frames, including frames without a matching image.
+        let regional_recolor_start = Instant::now();
+        let regional_recolor_log =
+            map_recolorer.finish_frame(&mut slam_map.global_voxel_map, |path| load_rgb_image(path));
+        let regional_recolor_time = recolor_capture_time + regional_recolor_start.elapsed();
+        if regional_recolor_log.ran {
+            log::info!(
+                "Frame {i}: regional recolor completed_frames={} regions={}/{} \
+                 groups={} largest_group={} merged={} switched={} colored={} cleared={} \
+                 deferred={} failed_images={} window={}..{} normals={}/{} \
+                 view_pass={} best_oblique={} no_normal={} retained={} time={:.3} ms",
+                regional_recolor_log.completed_frames,
+                regional_recolor_log.recolored_regions,
+                regional_recolor_log.evaluated_regions,
+                regional_recolor_log.recolored_groups,
+                regional_recolor_log.largest_group_regions,
+                regional_recolor_log.merged_groups,
+                regional_recolor_log.switched_regions,
+                regional_recolor_log.colored_points,
+                regional_recolor_log.cleared_points,
+                regional_recolor_log.deferred_regions,
+                regional_recolor_log.failed_images,
+                regional_recolor_log.window_first_frame,
+                regional_recolor_log.window_last_frame,
+                regional_recolor_log.window_normal_samples,
+                regional_recolor_log.window_observations,
+                regional_recolor_log.preferred_view_groups,
+                regional_recolor_log.best_oblique_view_groups,
+                regional_recolor_log.no_normal_view_groups,
+                regional_recolor_log.retained_image_groups,
+                duration_ms(regional_recolor_time),
+            );
+        }
+
+        // Save AFTER the exact configured recolor tick; no duplicate modulo
+        // or hardcoded interval, and no extra geometry/photometric updates.
+        let snapshot_start = Instant::now();
+        let recolor_snapshot = if regional_recolor_log.ran {
+            if let Some(writer) = &snapshot_writer {
+                let sources = map_recolorer.assignments();
+                try_save_recolor_snapshot(
+                    writer,
+                    &slam_map.global_voxel_map,
+                    SnapshotContext {
+                        phase: SnapshotPhase::AfterRecolor,
+                        input_frame_index: Some(i),
+                        timestamp_sec: Some(current_frame_start_time),
+                        recolor: &regional_recolor_log,
+                        region_sources: &sources,
+                    },
+                )
+            } else {
+                RecolorSnapshotLog::default()
+            }
+        } else {
+            RecolorSnapshotLog::default()
+        };
+        let recolor_snapshot_time = snapshot_start.elapsed();
+
         prev_frame_start_time = current_frame_start_time;
 
         let frame_processing_time = frame_processing_start.elapsed();
@@ -1417,6 +1667,8 @@ fn main() -> Result<()> {
             build_source_maps_ms: duration_ms(build_map_end),
             icp_ms: duration_ms(loop_end),
             visual_alignment_ms: duration_ms(visual_alignment_time),
+            regional_recolor_ms: duration_ms(regional_recolor_time),
+            recolor_snapshot_ms: duration_ms(recolor_snapshot_time),
             pose_update_ms: duration_ms(pose_update_time),
             global_filter_ms: duration_ms(global_filter_time),
             global_map_update_ms: duration_ms(global_map_update_time),
@@ -1501,6 +1753,8 @@ fn main() -> Result<()> {
             pose_z: new_pos.z,
             timing,
             visual_alignment: visual_alignment_log,
+            regional_recolor: regional_recolor_log,
+            recolor_snapshot,
             eskf_update_applied,
             gyro_bias_radps: filter.state.bg.into(),
             accel_bias_mps2: filter.state.ba.into(),
@@ -1514,9 +1768,63 @@ fn main() -> Result<()> {
         });
     }
 
+    // Make delayed map normals available for the last window's mean, including
+    // short sequences. Keep the existing full classification to one call.
+    // 終端処理: 遅延キューの状態に依存せず、現在の全累積点で全セルを再判定する。
+    let final_surface_start = Instant::now();
+    let final_surface_stats = slam_map
+        .global_voxel_map
+        .classify_all_surface_voxels(&surface_filter_config);
+    log::info!(
+        "Final surface classification: evaluated={}, planar={}, non_planar={}, unknown={} in {:.2?}",
+        final_surface_stats.evaluated,
+        final_surface_stats.planar,
+        final_surface_stats.non_planar,
+        final_surface_stats.unknown,
+        final_surface_start.elapsed(),
+    );
+
+    // Flush the last 1..29 pending frames before either RGB map is exported.
+    let final_recolor_start = Instant::now();
+    let final_recolor_log =
+        map_recolorer.flush(&mut slam_map.global_voxel_map, |path| load_rgb_image(path));
+    log::info!(
+        "Final regional recolor: {:?} in {:.2?}",
+        final_recolor_log,
+        final_recolor_start.elapsed()
+    );
+    std::fs::create_dir_all(&save_dir)?;
+    std::fs::write(
+        format!("{save_dir}/regional_recolor_final.json"),
+        serde_json::to_string_pretty(&final_recolor_log)?,
+    )?;
+    std::fs::write(
+        format!("{save_dir}/regional_recolor_assignments.json"),
+        serde_json::to_string_pretty(&map_recolorer.assignments())?,
+    )?;
+
+    if let Some(writer) = &snapshot_writer {
+        let sources = map_recolorer.assignments();
+        let final_snapshot = try_save_recolor_snapshot(
+            writer,
+            &slam_map.global_voxel_map,
+            SnapshotContext {
+                phase: SnapshotPhase::FinalFlush,
+                input_frame_index: frame_logs.last().map(|frame| frame.frame_index),
+                timestamp_sec: frame_logs.last().map(|frame| frame.timestamp),
+                recolor: &final_recolor_log,
+                region_sources: &sources,
+            },
+        );
+        std::fs::write(
+            format!("{save_dir}/recolor_snapshot_final.json"),
+            serde_json::to_vec_pretty(&final_snapshot)?,
+        )?;
+    }
+
     log_timing_summary(&frame_logs);
 
-    // --- Save the global voxel maps before and after final plane classification ---
+    // --- Save unfiltered and planar-only global voxel maps ---
     let min_samples = slam_map.global_voxel_map.config.min_points_per_voxel as u64;
 
     let min_frames = slam_map
@@ -1562,17 +1870,8 @@ fn main() -> Result<()> {
     );
 
     // 平面処理前の色付き点群: before_plane_filter と同じセル条件で、色を持つセルだけを保存する。
-    let world_map_rgb_before_plane_filter: Vec<PointXYZRGB> = slam_map
-        .global_voxel_map
-        .voxel_map
-        .values()
-        .filter(|cell| {
-            cell.sample_count >= min_samples
-                && cell.observed_frames >= min_frames
-                && cell.mean.coords.iter().all(|value| value.is_finite())
-        })
-        .filter_map(|cell| cell.rgb.map(|rgb| PointXYZRGB::new(cell.mean, rgb)))
-        .collect();
+    let world_map_rgb_before_plane_filter =
+        collect_colored_world_map(&slam_map.global_voxel_map, false);
 
     let world_map_rgb_before_plane_filter_path = format!(
         "{}/voxel-{}_world_map_rgb_before_plane_filter.pcd",
@@ -1594,32 +1893,7 @@ fn main() -> Result<()> {
         );
     }
 
-    // 終端処理: 遅延キューの状態に依存せず、現在の全累積点で全セルを再判定する。
-    let final_surface_start = Instant::now();
-    let final_surface_stats = slam_map
-        .global_voxel_map
-        .classify_all_surface_voxels(&surface_filter_config);
-    log::info!(
-        "Final surface classification: evaluated={}, planar={}, non_planar={}, unknown={} in {:.2?}",
-        final_surface_stats.evaluated,
-        final_surface_stats.planar,
-        final_surface_stats.non_planar,
-        final_surface_stats.unknown,
-        final_surface_start.elapsed(),
-    );
-
-    let planar_world_map_rgb: Vec<PointXYZRGB> = slam_map
-        .global_voxel_map
-        .voxel_map
-        .values()
-        .filter(|cell| {
-            cell.sample_count >= min_samples
-                && cell.observed_frames >= min_frames
-                && cell.surface_status == SurfaceStatus::Planar
-                && cell.mean.coords.iter().all(|value| value.is_finite())
-        })
-        .filter_map(|cell| cell.rgb.map(|rgb| PointXYZRGB::new(cell.mean, rgb)))
-        .collect();
+    let planar_world_map_rgb = collect_colored_world_map(&slam_map.global_voxel_map, true);
 
     let planar_world_map_rgb_path = format!(
         "{}/voxel-{}_world_map_rgb.pcd",
@@ -1671,7 +1945,7 @@ fn main() -> Result<()> {
         planar_world_map_points_xyz.len(),
         planar_world_map_path,
     );
-    // --- Save the global voxel maps before and after final plane classification ---
+    // --- Save unfiltered and planar-only global voxel maps ---
 
     // --- Save per-frame ICP logs to JSON ---
     let frame_logs_path = format!("{}/frame_logs.json", save_dir);
@@ -1705,7 +1979,7 @@ fn log_timing_summary(frame_logs: &[FrameLog]) {
         return;
     }
 
-    let stages: [(&str, fn(&FrameTiming) -> f64); 15] = [
+    let stages: [(&str, fn(&FrameTiming) -> f64); 17] = [
         ("load_pcd", |t| t.load_pcd_ms),
         ("timestamps", |t| t.timestamps_ms),
         ("imu_predict", |t| t.imu_predict_ms),
@@ -1715,6 +1989,8 @@ fn log_timing_summary(frame_logs: &[FrameLog]) {
         ("build_source_maps", |t| t.build_source_maps_ms),
         ("icp", |t| t.icp_ms),
         ("visual_alignment", |t| t.visual_alignment_ms),
+        ("regional_recolor", |t| t.regional_recolor_ms),
+        ("recolor_snapshot", |t| t.recolor_snapshot_ms),
         ("pose_update", |t| t.pose_update_ms),
         ("global_filter", |t| t.global_filter_ms),
         ("global_map_update", |t| t.global_map_update_ms),
@@ -1918,6 +2194,321 @@ fn make_imu_to_airy96_rotation() -> UnitQuaternion<f64> {
 /// （IMU-LiDAR間の並進はファイル冒頭のコメントを参照）。
 fn make_imu_to_avia_rotation() -> UnitQuaternion<f64> {
     UnitQuaternion::identity()
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use re_lidar_slam::voxel_map::{FrameEntry, VoxelCell, VoxelKey};
+
+    struct TestDirectory(PathBuf);
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "slam_snapshots_{label}_{}_{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn map() -> LOCALMap {
+        let mut map = LOCALMap::new(LocalMapConfig {
+            index_voxel_size: 0.1,
+            max_points_per_voxel: 100,
+            min_points_per_voxel: 2,
+            min_observed_frames_per_voxel: 2,
+            max_frames: 1000,
+            max_distance: 100.0,
+        });
+        let key = VoxelKey {
+            ix: 2,
+            iy: 2,
+            iz: 40,
+        };
+        let mut cell = VoxelCell::new();
+        cell.mean = Point3::new(0.2, 0.2, 4.0);
+        cell.voxel_key = key;
+        cell.sample_count = 2;
+        cell.observed_frames = 2;
+        map.voxel_map.insert(key, cell);
+        map.frame_index.push_back(FrameEntry {
+            frame_id: 0,
+            origin: Point3::origin(),
+            dirty_keys: [key].into_iter().collect(),
+        });
+        map
+    }
+
+    fn write_pcd(points: &Vec<PointXYZRGB>, path: &str) -> Result<()> {
+        let mut writer: pcd_rs::Writer<PointXYZRGB, _> = pcd_rs::WriterInit {
+            width: points.len() as u64,
+            height: 1,
+            viewpoint: Default::default(),
+            data_kind: pcd_rs::DataKind::Binary,
+            schema: None,
+        }
+        .create(path)?;
+        for point in points {
+            writer.push(point)?;
+        }
+        writer.finish()?;
+        Ok(())
+    }
+
+    fn read_pcd(report: &RecolorSnapshotLog) -> Vec<PointXYZRGB> {
+        let reader: pcd_rs::Reader<PointXYZRGB, _> =
+            pcd_rs::Reader::open(report.pcd_path.as_ref().unwrap()).unwrap();
+        reader.collect::<Result<Vec<_>>>().unwrap()
+    }
+
+    #[test]
+    fn snapshots_follow_configured_recolor_ticks_and_preserve_earlier_rgb() {
+        let root = TestDirectory::new("cadence");
+        for every in [30, 7] {
+            let writer = RecolorSnapshotWriter::new(&root.0).unwrap();
+            let mut map = map();
+            let mut recolorer = MapRecolorer::new(MapRecolorConfig {
+                update_every_frames: every,
+                ..Default::default()
+            });
+            let red = image::RgbImage::from_pixel(96, 96, image::Rgb([200, 40, 20]));
+            let blue = image::RgbImage::from_pixel(96, 96, image::Rgb([20, 40, 200]));
+            let camera = CameraIntrinsics {
+                width: 96,
+                height: 96,
+                fx: 60.0,
+                fy: 60.0,
+                cx: 48.0,
+                cy: 48.0,
+                distortion: [0.0; 5],
+            };
+            let mut reports = Vec::new();
+            for frame in 1..=every * 2 {
+                map.frame_index.back_mut().unwrap().frame_id = frame;
+                recolorer.note_map_update(&map);
+                if frame == 1 {
+                    recolorer.observe_image(
+                        1.0,
+                        Path::new("red.png"),
+                        &red,
+                        &camera,
+                        &Matrix4::identity(),
+                    );
+                }
+                if frame == every + 1 {
+                    let mut closer = Matrix4::identity();
+                    closer[(2, 3)] = -2.0;
+                    recolorer.observe_image(
+                        frame as f64,
+                        Path::new("blue.png"),
+                        &blue,
+                        &camera,
+                        &closer,
+                    );
+                }
+                let report = recolorer.finish_frame(&mut map, |path| {
+                    Ok(if path == Path::new("red.png") {
+                        red.clone()
+                    } else {
+                        blue.clone()
+                    })
+                });
+                if report.ran {
+                    let sources = recolorer.assignments();
+                    reports.push(
+                        writer
+                            .save_with(
+                                &map,
+                                SnapshotContext {
+                                    phase: SnapshotPhase::AfterRecolor,
+                                    input_frame_index: Some(frame as usize - 1),
+                                    timestamp_sec: Some(frame as f64),
+                                    recolor: &report,
+                                    region_sources: &sources,
+                                },
+                                write_pcd,
+                            )
+                            .unwrap(),
+                    );
+                }
+            }
+            assert_eq!(reports.len(), 2);
+            assert!(
+                reports[0]
+                    .pcd_path
+                    .as_ref()
+                    .unwrap()
+                    .ends_with(&format!("frame_{every:06}_after.pcd"))
+            );
+            assert!(
+                reports[1]
+                    .pcd_path
+                    .as_ref()
+                    .unwrap()
+                    .ends_with(&format!("frame_{:06}_after.pcd", every * 2))
+            );
+            let first = read_pcd(&reports[0]);
+            let second = read_pcd(&reports[1]);
+            assert_eq!(first.len(), 1);
+            assert_eq!(second.len(), 1);
+            assert_eq!(first[0].rgb.to_bits(), (200 << 16) | (40 << 8) | 20);
+            assert_eq!(second[0].rgb.to_bits(), (20 << 16) | (40 << 8) | 200);
+            assert_eq!(first[0].x.to_bits(), second[0].x.to_bits());
+            let json: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(reports[1].metadata_path.as_ref().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(json["completed_frames"], every * 2);
+            assert_eq!(json["point_count"], 1);
+            assert_eq!(json["regional_recolor"]["completed_frames"], every * 2);
+            assert_eq!(json["region_sources"][0]["image_path"], "blue.png");
+        }
+    }
+
+    #[test]
+    fn snapshots_include_mature_unknown_surfaces_and_match_final_rgb_filters_without_mutation() {
+        let root = TestDirectory::new("filters");
+        let writer = RecolorSnapshotWriter::new(&root.0).unwrap();
+        let mut map = map();
+        map.voxel_map.values_mut().next().unwrap().rgb = Some([100, 120, 60]);
+        let template = map.voxel_map.values().next().unwrap().clone();
+        for index in 1..=6 {
+            let mut cell = template.clone();
+            cell.voxel_key.ix += index;
+            cell.mean.x += index as f32 * 0.1;
+            match index {
+                1 => cell.surface_status = SurfaceStatus::Planar,
+                2 => cell.rgb = None,
+                3 => cell.sample_count = 1,
+                4 => cell.observed_frames = 1,
+                5 => cell.mean.x = f32::NAN,
+                _ => cell.mean.x = f32::INFINITY,
+            }
+            map.voxel_map.insert(cell.voxel_key, cell);
+        }
+        let before = map.voxel_map.clone();
+        let recolor = MapRecolorLog {
+            completed_frames: 30,
+            ran: true,
+            ..Default::default()
+        };
+        let report = writer
+            .save_with(
+                &map,
+                SnapshotContext {
+                    phase: SnapshotPhase::AfterRecolor,
+                    input_frame_index: Some(29),
+                    timestamp_sec: Some(10.0),
+                    recolor: &recolor,
+                    region_sources: &[],
+                },
+                write_pcd,
+            )
+            .unwrap();
+        assert_eq!(read_pcd(&report).len(), 2);
+        assert_eq!(collect_colored_world_map(&map, false).len(), 2);
+        assert_eq!(collect_colored_world_map(&map, true).len(), 1);
+        assert_eq!(before.len(), map.voxel_map.len());
+        for (key, cell) in &map.voxel_map {
+            assert_eq!(cell.mean.x.to_bits(), before[key].mean.x.to_bits());
+            assert_eq!(cell.rgb, before[key].rgb);
+            assert_eq!(cell.sample_count, before[key].sample_count);
+            assert_eq!(cell.observed_frames, before[key].observed_frames);
+        }
+    }
+
+    #[test]
+    fn empty_snapshots_have_metadata_and_final_flush_never_overwrites_the_scheduled_snapshot() {
+        let root = TestDirectory::new("empty");
+        let writer = RecolorSnapshotWriter::new(&root.0).unwrap();
+        let other = RecolorSnapshotWriter::new(&root.0).unwrap();
+        assert_ne!(writer.directory, other.directory);
+        let mut map = map();
+        let recolor = MapRecolorLog {
+            completed_frames: 60,
+            ran: true,
+            ..Default::default()
+        };
+        let report = writer
+            .save_with(
+                &map,
+                SnapshotContext {
+                    phase: SnapshotPhase::AfterRecolor,
+                    input_frame_index: Some(59),
+                    timestamp_sec: None,
+                    recolor: &recolor,
+                    region_sources: &[],
+                },
+                |_, _| panic!("empty clouds must not call the PCD writer"),
+            )
+            .unwrap();
+        assert!(report.attempted);
+        assert!(!report.saved);
+        assert!(report.pcd_path.is_none());
+        let bytes = std::fs::read(report.metadata_path.as_ref().unwrap()).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["status"], "empty");
+        map.voxel_map.values_mut().next().unwrap().rgb = Some([100, 120, 60]);
+        let final_report = writer
+            .save_with(
+                &map,
+                SnapshotContext {
+                    phase: SnapshotPhase::FinalFlush,
+                    input_frame_index: Some(59),
+                    timestamp_sec: None,
+                    recolor: &recolor,
+                    region_sources: &[],
+                },
+                write_pcd,
+            )
+            .unwrap();
+        assert!(final_report.saved);
+        assert!(
+            final_report
+                .pcd_path
+                .unwrap()
+                .ends_with("frame_000060_final.pcd")
+        );
+        assert_eq!(std::fs::read(report.metadata_path.unwrap()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn failed_pcd_write_leaves_no_partial_or_false_success_files_and_can_be_retried() {
+        let root = TestDirectory::new("error");
+        let writer = RecolorSnapshotWriter::new(&root.0).unwrap();
+        let mut map = map();
+        map.voxel_map.values_mut().next().unwrap().rgb = Some([100, 120, 60]);
+        let recolor = MapRecolorLog {
+            completed_frames: 30,
+            ran: true,
+            ..Default::default()
+        };
+        let context = || SnapshotContext {
+            phase: SnapshotPhase::AfterRecolor,
+            input_frame_index: Some(29),
+            timestamp_sec: None,
+            recolor: &recolor,
+            region_sources: &[],
+        };
+        let result = writer.save_with(&map, context(), |_, path| {
+            std::fs::write(path, b"incomplete")?;
+            anyhow::bail!("simulated write failure")
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(&writer.directory).unwrap().count(), 0);
+        assert!(writer.save_with(&map, context(), write_pcd).unwrap().saved);
+    }
 }
 
 #[cfg(test)]
