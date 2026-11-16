@@ -14,6 +14,7 @@ use re_lidar_slam::{
         load_rgb_image, save_pcd_xyz, save_pcd_xyzrgb,
     },
     find_nearest_points::pickup_valid_source_points,
+    group_recolor::{GroupRecolorConfig, GroupRecolorer, ImageCandidate},
     icp::{
         Vector6f, build_robust_point_to_plane_system, compute_rmse, compute_robust_cost,
         solve_icp_delta_observable,
@@ -479,12 +480,13 @@ fn main() -> Result<()> {
     let mut prev_frame_start_time: f64 = 0.0;
     let mut frame_logs: Vec<FrameLog> = Vec::new();
     let mut visual_aligner = VisualAligner::new(VisualAlignmentConfig::default());
+    let mut group_recolorer = GroupRecolorer::new(GroupRecolorConfig::default());
 
     let camera_from_lidar = build_camera_from_lidar(
         Vector3::new(0.01, 0.2, 0.035), // カメラ位置 [m]
         -1.0,                           // roll [deg]
-        -0.5,                            // pitch [deg]
-        -1.0,                            // yaw [deg]
+        -0.5,                           // pitch [deg]
+        -1.0,                           // yaw [deg]
     );
 
     //
@@ -1290,54 +1292,10 @@ fn main() -> Result<()> {
         let global_filter_time = global_filter_start.elapsed();
 
         let coloring_global_rgb_start = Instant::now();
-        let global_source_rgb: Option<Vec<Option<ColorObservation>>> = match (
-            map_update_allowed,
-            selected_rgb_image.as_ref(),
-            camera_from_world_at_image.as_ref(),
-        ) {
-            (true, Some(rgb_image), Some(camera_from_world)) => {
-                let intrinsics =
-                    CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
-
-                // LiDARフレーム開始時の座標 → 画像撮影時のカメラ座標
-                let camera_from_lidar_start =
-                    camera_from_world * current_frame_info.current_global_pose;
-
-                let colors: Vec<Option<ColorObservation>> = global_source_points
-                    .iter()
-                    .map(|point| {
-                        let camera_point =
-                            camera_from_lidar_start.transform_point(&point.cast::<f64>());
-
-                        let (u, v) = project_camera_point(&camera_point, &intrinsics)?;
-
-                        let rgb = rgb_image.get_pixel_checked(u, v)?.0;
-
-                        // カメラ座標の原点は、画像撮影時のカメラ位置。
-                        // この点の長さが、カメラから対象点までの距離になる。
-                        let distance_m = camera_point.coords.norm();
-
-                        if !distance_m.is_finite() || distance_m <= 0.0 {
-                            return None;
-                        }
-
-                        Some(ColorObservation { rgb, distance_m })
-                    })
-                    .collect();
-
-                let colored_count = colors.iter().filter(|color| color.is_some()).count();
-
-                log::debug!(
-                    "Frame {i}: GlobalMap input RGB: {} / {} points",
-                    colored_count,
-                    global_source_points.len(),
-                );
-
-                Some(colors)
-            }
-            _ => None,
-        };
-        let coloring_global_rgb_time = coloring_global_rgb_start.elapsed();
+        // GlobalMapのRGBは、グループで選んだ代表画像から付与する。
+        let global_source_rgb: Option<Vec<Option<ColorObservation>>> = None;
+        // let mut coloring_global_rgb_time = Duration::ZERO;
+        let mut coloring_global_rgb_time = coloring_global_rgb_start.elapsed();
 
         let global_map_update_start = Instant::now();
         let global_update_stats = if map_update_allowed {
@@ -1349,6 +1307,17 @@ fn main() -> Result<()> {
                     &current_frame_info.current_global_pose,
                     &world_map_update_filter_config,
                 )
+        } else {
+            Default::default()
+        };
+        // 遅延平面判定がframe_indexを消費する前に取得する。
+        let group_frame_keys = if map_update_allowed {
+            slam_map
+                .global_voxel_map
+                .frame_index
+                .back()
+                .map(|entry| entry.dirty_keys.clone())
+                .unwrap_or_default()
         } else {
             Default::default()
         };
@@ -1382,6 +1351,34 @@ fn main() -> Result<()> {
             );
         }
         // --- Filter valid source points, then update the WorldMap ---
+        let group_recolor_start = Instant::now();
+
+        let group_candidate = if map_update_allowed {
+            match (
+                selected_image,
+                selected_rgb_image.as_ref(),
+                camera_from_world_at_image.as_ref(),
+            ) {
+                (Some(metadata), Some(rgb), Some(camera_from_world)) => {
+                    let path = std::path::Path::new(&image_meta_dir).join(&metadata.file_name);
+
+                    Some(ImageCandidate::new(path, rgb, *camera_from_world)?)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        group_recolorer.push_frame(
+            (i + 1) as u64,
+            group_frame_keys,
+            group_candidate,
+            &mut slam_map.global_voxel_map,
+        );
+
+        // 既存のGlobalMap着色時間へ集計する。
+        coloring_global_rgb_time += group_recolor_start.elapsed();
 
         // --- Update the LocalMap with the new frame's points ---
         let local_map_update_start = Instant::now();
@@ -1514,6 +1511,7 @@ fn main() -> Result<()> {
         });
     }
 
+    group_recolorer.flush(&mut slam_map.global_voxel_map);
     log_timing_summary(&frame_logs);
 
     // --- Save the global voxel maps before and after final plane classification ---
