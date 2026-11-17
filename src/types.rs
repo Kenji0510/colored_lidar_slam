@@ -124,9 +124,11 @@ pub struct FrameTiming {
     pub coloring_image_load_ms: f64,
     /// Time spent predicting the LiDAR/camera pose at the image timestamp.
     pub coloring_image_pose_ms: f64,
-    /// Time spent projecting deskewed points into the image.
+    /// Color map: projecting the deskewed points into the image, the same-frame
+    /// occlusion check and bilinear color sampling (`ColorMap::sample_frame`).
     pub coloring_projection_ms: f64,
-    /// Time spent sampling image colors for the deskewed frame points.
+    /// Color map: accumulating the sampled colors into the fine voxels
+    /// (`ColorMap::accumulate`).
     pub coloring_colorize_ms: f64,
     /// Time spent sampling image colors for the GlobalMap input points.
     pub coloring_global_rgb_ms: f64,

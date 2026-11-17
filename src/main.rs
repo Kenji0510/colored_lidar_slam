@@ -2,8 +2,9 @@ use anyhow::{Result, bail};
 use nalgebra::{Matrix3, Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
 use re_lidar_slam::{
     camera::{
-        CameraIntrinsics, build_camera_from_lidar, colorize_world_points, project_camera_point,
+        CameraIntrinsics, build_camera_from_lidar, project_camera_point,
     },
+    color_map::{ColorMap, ColorMapConfig},
     deskew_points::deskew_points,
     eskf::{
         Eskf, EskfConfig, ImuModel, ImuNoise, InitialStd, NavState, STANDARD_GRAVITY_MPS2,
@@ -35,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/01";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/02";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
 const SAVE_ROOT_DIR: &str = "data/output/11142026";
 
@@ -252,6 +253,11 @@ const ICP_VERTICAL_RECOVERY_MAX_TRANSLATION_CORRECTION_M: f32 = 0.60;
 const MIN_IMU_SAMPLES_PER_POINT_CLOUD_FRAME: usize = 5;
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 150.0;
+
+// --- 色専用マップ ---
+// 点単位の色を、このセルの大きさで位置・色を平均して保存する（GlobalMap とは別）。
+// 小さくするほど細かくなるが、メモリ（1 セル約 50 バイト）とファイルが大きくなる。
+const COLOR_MAP_VOXEL_SIZE_M: f32 = 0.01;
 
 // --- ESKF ---
 // IMU ノイズ密度。データシート値（例: BMI088 はジャイロ約 2.4e-4 rad/s/√Hz、
@@ -479,6 +485,10 @@ fn main() -> Result<()> {
     let mut prev_frame_start_time: f64 = 0.0;
     let mut frame_logs: Vec<FrameLog> = Vec::new();
     let mut visual_aligner = VisualAligner::new(VisualAlignmentConfig::default());
+    let mut color_map = ColorMap::new(ColorMapConfig {
+        voxel_size_m: COLOR_MAP_VOXEL_SIZE_M,
+        ..ColorMapConfig::default()
+    });
 
     let camera_from_lidar = build_camera_from_lidar(
         Vector3::new(0.01, 0.2, 0.035), // カメラ位置 [m]
@@ -1195,61 +1205,46 @@ fn main() -> Result<()> {
         }
         let coloring_image_pose_time = coloring_image_pose_start.elapsed();
 
+        // --- Color map: 点単位の色を細かいボクセルで平均して蓄積する ---
+        // GlobalMap（幾何用。2.5 cm セル・平面フィルタあり・色は観測 1 回分）とは別に、
+        // deskew 済みの全点を位置合わせ後の姿勢で画像へ投影し、バイリニア補間した色を
+        // COLOR_MAP_VOXEL_SIZE_M のセルごとに距離で重み付けして平均する。
+        // LiDAR の更新が採用されたフレームだけを使う（姿勢が怪しいフレームの色は混ぜない）。
         let coloring_projection_start = Instant::now();
-        let projected_pixels = if let (Some(rgb_image), Some(camera_from_world)) = (
+        let color_frame = match (
+            map_update_allowed,
             selected_rgb_image.as_ref(),
             camera_from_world_at_image.as_ref(),
         ) {
-            let intrinsics =
-                CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
-
-            // 開始時刻基準の点群 → 世界座標 → 画像時刻のカメラ座標。
-            let camera_from_lidar_start =
-                camera_from_world * current_frame_info.current_global_pose;
-
-            let pixels: Vec<Option<(u32, u32)>> = deskewed_points
-                .iter()
-                .map(|point| {
-                    let camera_point =
-                        camera_from_lidar_start.transform_point(&point.cast::<f64>());
-
-                    project_camera_point(&camera_point, &intrinsics)
-                })
-                .collect();
-
-            log::info!(
-                "Frame {i}: projection candidates={}/{} image={}x{}",
-                pixels.iter().flatten().count(),
-                pixels.len(),
-                intrinsics.width,
-                intrinsics.height,
-            );
-
-            Some(pixels)
-        } else {
-            None
+            (true, Some(rgb_image), Some(camera_from_world)) => {
+                let intrinsics =
+                    CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
+                Some(color_map.sample_frame(
+                    &deskewed_points,
+                    &current_frame_info.current_global_pose,
+                    camera_from_world,
+                    rgb_image,
+                    &intrinsics,
+                ))
+            }
+            _ => None,
         };
         let coloring_projection_time = coloring_projection_start.elapsed();
 
         let coloring_colorize_start = Instant::now();
-        let colored_world_points = colorize_world_points(
-            &deskewed_points,
-            &current_frame_info.current_global_pose,
-            selected_rgb_image.as_ref(),
-            projected_pixels.as_deref(),
-        )?;
-
-        let colored_count = colored_world_points
-            .iter()
-            .filter(|point| point.rgb.is_some())
-            .count();
-
-        log::info!(
-            "Frame {i}: colored={} uncolored={} total={}",
-            colored_count,
-            colored_world_points.len() - colored_count,
-            colored_world_points.len(),
-        );
+        if let Some(color_frame) = &color_frame {
+            let new_voxels = color_map.accumulate(&color_frame.samples);
+            log::info!(
+                "Frame {i}: color map input={} in_image={} occluded={} sampled={} \
+                 new_voxels={} total_voxels={}",
+                color_frame.input_points,
+                color_frame.in_image,
+                color_frame.occluded,
+                color_frame.samples.len(),
+                new_voxels,
+                color_map.len(),
+            );
+        }
         let coloring_colorize_time = coloring_colorize_start.elapsed();
         // --- Colorize the registered frame ---
         // --- Update current frame info ---
@@ -1684,6 +1679,27 @@ fn main() -> Result<()> {
         planar_world_map_path,
     );
     // --- Save the global voxel maps before and after final plane classification ---
+
+    // --- Save the color map (point-level colors averaged per fine voxel) ---
+    let color_map_points = color_map.export_points();
+    let color_map_path = format!(
+        "{}/voxel-{}_color_map_rgb.pcd",
+        save_dir, COLOR_MAP_VOXEL_SIZE_M,
+    );
+    if color_map_points.is_empty() {
+        log::info!("Color map export skipped: no colored points");
+    } else {
+        save_pcd_xyzrgb(&color_map_points, &color_map_path)?;
+        log::info!(
+            "Saved color map: {} voxels -> {} points (min_observations={}, out_of_range={}) -> {}",
+            color_map.len(),
+            color_map_points.len(),
+            color_map.config.min_observations,
+            color_map.out_of_range_samples(),
+            color_map_path,
+        );
+    }
+    // --- Save the color map ---
 
     // --- Save per-frame ICP logs to JSON ---
     let frame_logs_path = format!("{}/frame_logs.json", save_dir);
