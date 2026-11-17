@@ -104,6 +104,9 @@ pub struct FrameTiming {
     pub global_map_update_ms: f64,
     pub delayed_surface_ms: f64,
     pub local_map_update_ms: f64,
+    /// Keyframe image pasting: syncing the planar copy of the GlobalMap and pasting
+    /// the keyframes whose scheduled frame has been reached.
+    pub keyframe_paste_ms: f64,
     /// Total time spent coloring the registered frame (sum of `coloring_*`).
     pub coloring_ms: f64,
     /// Per-frame processing time excluding PCD file I/O.

@@ -18,6 +18,9 @@ use re_lidar_slam::{
         Vector6f, build_robust_point_to_plane_system, compute_rmse, compute_robust_cost,
         solve_icp_delta_observable,
     },
+    keyframe_paste::{
+        KeyframeImage, KeyframePasteConfig, KeyframePaster, PasteStats, keyframe_debug_color,
+    },
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory},
     types::{
         CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap,
@@ -31,6 +34,7 @@ use re_lidar_slam::{
     voxelization::{voxel_downsample_points, voxel_downsample_points_and_maps_dual},
 };
 use std::{
+    collections::HashSet,
     ffi::OsString,
     time::{Duration, Instant},
 };
@@ -215,6 +219,10 @@ const SURFACE_MIN_PLANARITY: f32 = 0.20;
 const SURFACE_MAX_VARIATION: f32 = 0.04;
 const SURFACE_MAX_PCA_RMSE_M: f32 = 0.025;
 const SURFACE_MAX_CENTER_DISTANCE_M: f32 = 0.025;
+
+// キーフレーム画像の貼り付け: キーフレーム N+1 が確定してから、このフレーム数の後に
+// N を貼る。N の視野の平面判定（上の遅延判定）が出そろうのを待つため、同じ値にする。
+const KEYFRAME_PASTE_DELAY_FRAMES: u64 = SURFACE_CLASSIFICATION_DELAY_FRAMES;
 
 // 成熟した GlobalMap 平面に対する新規観測の更新ゲート。
 // 2 cm以内は同一面として平面へ射影し、2～10 cmは二重壁候補として保留する。
@@ -451,6 +459,11 @@ fn main() -> Result<()> {
         ),
         local_voxel_map: LOCALMap::new(local_map_config),
     };
+    // キーフレーム画像の貼り付け用コピーは、GlobalMap の平面判定の結果から作る。
+    // （キーフレームは視覚アライメントが作るので、無効なら記録も不要）
+    slam_map
+        .global_voxel_map
+        .set_surface_classification_log(visual_alignment_enabled);
     let surface_filter_config = SurfaceFilterConfig {
         neighbor_radius_voxels: SURFACE_NEIGHBOR_RADIUS_VOXELS,
         min_neighbors: SURFACE_MIN_NEIGHBORS,
@@ -479,6 +492,11 @@ fn main() -> Result<()> {
     let mut prev_frame_start_time: f64 = 0.0;
     let mut frame_logs: Vec<FrameLog> = Vec::new();
     let mut visual_aligner = VisualAligner::new(VisualAlignmentConfig::default());
+    // キーフレーム N+1 が確定したら、N の画像を GlobalMap の平面セルのコピーへ貼る。
+    let mut keyframe_paster = KeyframePaster::new(KeyframePasteConfig {
+        paste_delay_frames: KEYFRAME_PASTE_DELAY_FRAMES,
+        ..KeyframePasteConfig::default()
+    });
 
     let camera_from_lidar = build_camera_from_lidar(
         Vector3::new(0.01, 0.2, 0.035), // カメラ位置 [m]
@@ -1100,6 +1118,37 @@ fn main() -> Result<()> {
             visual_alignment_log.new_keyframe_points,
             duration_ms(visual_alignment_time),
         );
+
+        // --- Keyframe paste: register a newly confirmed keyframe ---
+        // このフレームで新しいキーフレーム（N+1）ができたら、その画像と確定姿勢を保持し、
+        // 1 つ前のキーフレーム N を KEYFRAME_PASTE_DELAY_FRAMES 後に貼る予約をする。
+        if let (Some(keyframe), Some(rgb_image)) =
+            (visual_aligner.keyframe_pose(), selected_rgb_image.as_ref())
+            && keyframe.frame_index == i as u64
+            && keyframe_paster.current_keyframe_index() != Some(keyframe.frame_index)
+        {
+            let camera = CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
+            let scheduled = keyframe_paster.on_new_keyframe(
+                i as u64,
+                KeyframeImage {
+                    frame_index: keyframe.frame_index,
+                    camera_from_world: keyframe.camera_from_world,
+                    camera,
+                    rgb: rgb_image.clone(),
+                },
+            );
+            match scheduled {
+                Some((previous, due_frame)) => log::info!(
+                    "Frame {i}: keyframe {} confirmed; keyframe {previous} will be pasted \
+                     at frame {due_frame}",
+                    keyframe.frame_index,
+                ),
+                None => log::info!(
+                    "Frame {i}: first keyframe {} registered for pasting",
+                    keyframe.frame_index,
+                ),
+            }
+        }
         // Keep geometric filtering and map insertion at the SAME final pose.
         let final_lidar_pose = filter.lidar_pose().cast::<f32>();
         r_mat = final_lidar_pose.fixed_view::<3, 3>(0, 0).into_owned();
@@ -1395,6 +1444,20 @@ fn main() -> Result<()> {
         }
         // --- Filter valid source points, then update the WorldMap ---
 
+        // --- Keyframe paste: sync the planar copy, then paste keyframes that are due ---
+        // 平面判定の結果（Planar / NonPlanar）をコピーへ反映してから、予定フレームに
+        // 達したキーフレームを貼る。遮蔽物は平面フィルタ前の GlobalMap の全セル。
+        let keyframe_paste_start = Instant::now();
+        keyframe_paster.sync_planes(&slam_map.global_voxel_map.take_surface_classification_log());
+        for stats in keyframe_paster.paste_due(
+            i as u64,
+            &slam_map.global_voxel_map.voxel_map,
+            GLOBAL_MAP_VOXEL_SIZE,
+        ) {
+            log_keyframe_paste(&format!("Frame {i}"), &stats);
+        }
+        let keyframe_paste_time = keyframe_paste_start.elapsed();
+
         // --- Update the LocalMap with the new frame's points ---
         let local_map_update_start = Instant::now();
         if map_update_allowed {
@@ -1434,6 +1497,7 @@ fn main() -> Result<()> {
             global_map_update_ms: duration_ms(global_map_update_time),
             delayed_surface_ms: duration_ms(delayed_surface_time),
             local_map_update_ms: duration_ms(local_map_update_time),
+            keyframe_paste_ms: duration_ms(keyframe_paste_time),
             coloring_ms: duration_ms(coloring_time),
             processing_total_ms: duration_ms(frame_processing_time),
             total_with_file_io_ms: duration_ms(frame_total_with_file_io),
@@ -1453,8 +1517,8 @@ fn main() -> Result<()> {
              imu_predict={:.3} ms, rotation_trajectory={:.3} ms, deskew={:.3} ms, \
              downsample={:.3} ms, build_source_maps={:.3} ms, icp={:.3} ms, \
              pose_update={:.3} ms, global_filter={:.3} ms, global_map_update={:.3} ms, \
-             delayed_surface={:.3} ms, local_map_update={:.3} ms, coloring={:.3} ms, \
-             total={:.3} ms (with_file_io={:.3} ms)",
+             delayed_surface={:.3} ms, local_map_update={:.3} ms, keyframe_paste={:.3} ms, \
+             coloring={:.3} ms, total={:.3} ms (with_file_io={:.3} ms)",
             duration_ms(load_pcd_time),
             duration_ms(timestamp_time),
             duration_ms(predict_pose_time),
@@ -1468,6 +1532,7 @@ fn main() -> Result<()> {
             duration_ms(global_map_update_time),
             duration_ms(delayed_surface_time),
             duration_ms(local_map_update_time),
+            duration_ms(keyframe_paste_time),
             duration_ms(coloring_time),
             duration_ms(frame_processing_time),
             duration_ms(frame_total_with_file_io),
@@ -1527,6 +1592,13 @@ fn main() -> Result<()> {
     }
 
     log_timing_summary(&frame_logs);
+
+    // キーフレーム貼り付け用の判定記録はここまで。終端の全セル再判定は記録せず
+    // （全セル分の記録はメモリを食うため）、再判定後のマップから直接コピーへ反映する。
+    keyframe_paster.sync_planes(&slam_map.global_voxel_map.take_surface_classification_log());
+    slam_map
+        .global_voxel_map
+        .set_surface_classification_log(false);
 
     // --- Save the global voxel maps before and after final plane classification ---
     let min_samples = slam_map.global_voxel_map.config.min_points_per_voxel as u64;
@@ -1620,6 +1692,19 @@ fn main() -> Result<()> {
         final_surface_start.elapsed(),
     );
 
+    // --- Keyframe paste: the keyframes still waiting, and the last keyframe ---
+    // 走行が終わり、マップはもう増えない。最終判定をコピーへ反映してから（終わり近くに
+    // 初めて見えた場所は、遅延判定がまだ届いていない）、貼り付け待ちのキーフレームと
+    // 最後のキーフレーム（次のキーフレームが来ないので予約されていない）を貼る。
+    if keyframe_paster.current_keyframe_index().is_some() {
+        keyframe_paster.sync_from_map(&slam_map.global_voxel_map.voxel_map);
+        for stats in
+            keyframe_paster.flush(&slam_map.global_voxel_map.voxel_map, GLOBAL_MAP_VOXEL_SIZE)
+        {
+            log_keyframe_paste("Final flush", &stats);
+        }
+    }
+
     let planar_world_map_rgb: Vec<PointXYZRGB> = slam_map
         .global_voxel_map
         .voxel_map
@@ -1685,6 +1770,67 @@ fn main() -> Result<()> {
     );
     // --- Save the global voxel maps before and after final plane classification ---
 
+    // --- Save the keyframe-pasted colors ---
+    // 色が貼られたセルを、最終の平面判定（surface_status）では絞らずに保存する。
+    // 走行中に Planar として貼られ、終端の再判定で NonPlanar / Unknown になったセルも含む。
+    // 点数・観測フレーム数の条件は world_map_rgb_before_plane_filter と同じ。
+    // source の方は、どのキーフレームから貼ったかを色分けしたもの。
+    let mut pasted_points: Vec<PointXYZRGB> = Vec::new();
+    let mut pasted_source_points: Vec<PointXYZRGB> = Vec::new();
+    let mut keyframes_used = HashSet::new();
+    let mut pasted_final_planar = 0usize;
+    for (key, cell) in &slam_map.global_voxel_map.voxel_map {
+        if !(cell.sample_count >= min_samples
+            && cell.observed_frames >= min_frames
+            && cell.mean.coords.iter().all(|value| value.is_finite()))
+        {
+            continue;
+        }
+        if let Some(color) = keyframe_paster.color(key) {
+            if cell.surface_status == SurfaceStatus::Planar {
+                pasted_final_planar += 1;
+            }
+            pasted_points.push(PointXYZRGB::new(cell.mean, color.rgb));
+            pasted_source_points.push(PointXYZRGB::new(
+                cell.mean,
+                keyframe_debug_color(color.keyframe_frame_index),
+            ));
+            keyframes_used.insert(color.keyframe_frame_index);
+        }
+    }
+    if pasted_points.is_empty() {
+        log::info!(
+            "Keyframe paste export skipped: no pasted points{}",
+            if visual_alignment_enabled {
+                ""
+            } else {
+                " (visual alignment is disabled, so there are no keyframes)"
+            },
+        );
+    } else {
+        let pasted_path = format!(
+            "{}/voxel-{}_world_map_rgb_keyframe_paste.pcd",
+            save_dir, GLOBAL_MAP_VOXEL_SIZE,
+        );
+        save_pcd_xyzrgb(&pasted_points, &pasted_path)?;
+        let source_path = format!(
+            "{}/voxel-{}_world_map_keyframe_paste_source.pcd",
+            save_dir, GLOBAL_MAP_VOXEL_SIZE,
+        );
+        save_pcd_xyzrgb(&pasted_source_points, &source_path)?;
+        log::info!(
+            "Saved keyframe-pasted world map (no final plane filter): {} points \
+             ({} of them final Planar, {} not) from {} keyframes → {} (source colors → {})",
+            pasted_points.len(),
+            pasted_final_planar,
+            pasted_points.len() - pasted_final_planar,
+            keyframes_used.len(),
+            pasted_path,
+            source_path,
+        );
+    }
+    // --- Save the keyframe-pasted colors ---
+
     // --- Save per-frame ICP logs to JSON ---
     let frame_logs_path = format!("{}/frame_logs.json", save_dir);
     let frame_logs_json = serde_json::to_string_pretty(&frame_logs)?;
@@ -1704,6 +1850,23 @@ fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
+fn log_keyframe_paste(context: &str, stats: &PasteStats) {
+    log::info!(
+        "{context}: pasted keyframe {}: in_view={} new={} overwritten={} kept={} occluded={} \
+         too_oblique={} sample_failed={} (planar copy={}, occluder cells={})",
+        stats.keyframe_frame_index,
+        stats.in_view,
+        stats.pasted_new,
+        stats.overwritten,
+        stats.kept_existing,
+        stats.occluded,
+        stats.too_oblique,
+        stats.sample_failed,
+        stats.target_cells,
+        stats.occluder_cells,
+    );
+}
+
 #[derive(Debug)]
 struct TimingStats {
     name: &'static str,
@@ -1717,7 +1880,7 @@ fn log_timing_summary(frame_logs: &[FrameLog]) {
         return;
     }
 
-    let stages: [(&str, fn(&FrameTiming) -> f64); 15] = [
+    let stages: [(&str, fn(&FrameTiming) -> f64); 16] = [
         ("load_pcd", |t| t.load_pcd_ms),
         ("timestamps", |t| t.timestamps_ms),
         ("imu_predict", |t| t.imu_predict_ms),
@@ -1732,6 +1895,7 @@ fn log_timing_summary(frame_logs: &[FrameLog]) {
         ("global_map_update", |t| t.global_map_update_ms),
         ("delayed_surface", |t| t.delayed_surface_ms),
         ("local_map_update", |t| t.local_map_update_ms),
+        ("keyframe_paste", |t| t.keyframe_paste_ms),
         ("coloring", |t| t.coloring_ms),
     ];
     let mut summaries: Vec<TimingStats> = stages
