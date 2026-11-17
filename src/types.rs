@@ -149,6 +149,30 @@ pub struct VisualAlignmentLog {
     pub new_landmarks: usize,
     pub refreshed_landmarks: usize,
     pub landmarks: usize,
+    /// Frame index of the keyframe K used for alignment (None before bootstrap).
+    pub keyframe_frame_index: Option<u64>,
+    /// Frames elapsed since K was created.
+    pub keyframe_age_frames: u64,
+    /// Number of patch points stored in K.
+    pub keyframe_points: usize,
+    /// Camera-center distance between K and the current image [m].
+    pub keyframe_baseline_m: Option<f64>,
+    /// ln(current mean intensity / K mean intensity).
+    pub brightness_log_ratio: Option<f64>,
+    /// K patches visible (in image and not occluded) at the prior pose.
+    pub visible_patches: usize,
+    /// K patches rejected by the depth-buffer occlusion check.
+    pub occluded_patches: usize,
+    /// Visible fraction of K patches at the aligned pose (keyframe switch criterion).
+    pub visible_ratio: Option<f64>,
+    /// Candidate / occluded counts when building a new K this frame.
+    pub keyframe_candidates: usize,
+    pub keyframe_candidates_occluded: usize,
+    /// Points in the newly built K (0 when no K was built).
+    pub new_keyframe_points: usize,
+    /// "none", "created:<reason>" or "skipped:<reason>:<cause>".
+    pub keyframe_event: String,
+    pub consecutive_failures: u32,
 }
 
 impl Default for VisualAlignmentLog {
@@ -166,6 +190,19 @@ impl Default for VisualAlignmentLog {
             new_landmarks: 0,
             refreshed_landmarks: 0,
             landmarks: 0,
+            keyframe_frame_index: None,
+            keyframe_age_frames: 0,
+            keyframe_points: 0,
+            keyframe_baseline_m: None,
+            brightness_log_ratio: None,
+            visible_patches: 0,
+            occluded_patches: 0,
+            visible_ratio: None,
+            keyframe_candidates: 0,
+            keyframe_candidates_occluded: 0,
+            new_keyframe_points: 0,
+            keyframe_event: "none".into(),
+            consecutive_failures: 0,
         }
     }
 }

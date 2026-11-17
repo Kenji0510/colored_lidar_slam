@@ -23,7 +23,7 @@ use re_lidar_slam::{
         CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap,
         VisualAlignmentLog,
     },
-    visual_alignment::{VisualAligner, VisualAlignmentConfig},
+    visual_alignment::{VisualAligner, VisualAlignmentConfig, VisualFrame},
     voxel_map::{
         ColorObservation, LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus,
         WorldMapUpdateFilterConfig,
@@ -35,7 +35,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/02";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/01";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
 const SAVE_ROOT_DIR: &str = "data/output/11142026";
 
@@ -142,7 +142,7 @@ where
 fn print_usage() {
     println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>] [--no-visual-alignment]");
     println!("  --lidar  Select the point-cloud sensor (default: mid70)");
-    println!("  --no-visual-alignment  Disable the grayscale 9x9 visual ESIKF update");
+    println!("  --no-visual-alignment  Disable the keyframe-based 9x9 visual ESIKF update");
 }
 
 // Mid-70 sparse-cloud preset.
@@ -1047,10 +1047,11 @@ fn main() -> Result<()> {
         };
         let map_update_allowed = local_map_was_empty || icp_ok;
 
-        // --- Direct image alignment: fixed historical 9x9 patches -> current image ---
-        // The image residual is evaluated at the image timestamp, but its Jacobian
-        // updates the 15D ESKF state at the LiDAR FRAME START. All following users
-        // (RGB projection, local/global registration, next IMU prediction) see it.
+        // --- Direct image alignment: keyframe 9x9 patches -> current image ---
+        // キーフレーム K のパッチ（GlobalMap の Planar 点＋法線付き平面）を今の画像へ投影し、
+        // 輝度が一致するように状態を補正する。残差は画像時刻で評価するが、更新するのは
+        // LiDAR フレーム開始時刻の 15 次元状態。以後の処理（色付け・マップ更新・次の IMU
+        // 予測）はすべてこの更新後の状態を使う。GlobalMap はこのフレームの点を入れる前の状態。
         let visual_alignment_start = Instant::now();
         let mut visual_alignment_log = VisualAlignmentLog::default();
         if !visual_alignment_enabled {
@@ -1061,31 +1062,42 @@ fn main() -> Result<()> {
             let camera = CameraIntrinsics::for_image_size(rgb.width(), rgb.height())?;
             visual_alignment_log = visual_aligner.process_frame(
                 filter,
-                &imu_data,
-                current_frame_start_time,
-                metadata.timestamp_sec,
-                i as u64,
-                rgb,
-                &camera,
-                &camera_from_lidar,
-                &downsampled_source_points_for_local,
+                &VisualFrame {
+                    imu: &imu_data,
+                    frame_start_time: current_frame_start_time,
+                    image_time: metadata.timestamp_sec,
+                    frame_index: i as u64,
+                    rgb,
+                    camera: &camera,
+                    camera_from_lidar: &camera_from_lidar,
+                    frame_points: &deskewed_points,
+                    planar_map: &slam_map.global_voxel_map.voxel_map,
+                },
             );
         } else {
             visual_alignment_log.status = "no_image".into();
         }
         let visual_alignment_time = visual_alignment_start.elapsed();
         log::info!(
-            "Frame {i}: visual status={} applied={} patches={} rmse={:?}->{:?} \
-             delta_t={:.4} m delta_r={:.4} deg refs={} added={} time={:.3} ms",
+            "Frame {i}: visual status={} applied={} patches={} (visible={} occluded={}) \
+             rmse={:?}->{:?} delta_t={:.4} m delta_r={:.4} deg | keyframe={:?} age={} \
+             points={} visible_ratio={:?} failures={} event={} new_points={} time={:.3} ms",
             visual_alignment_log.status,
             visual_alignment_log.update_applied,
             visual_alignment_log.matched_patches,
+            visual_alignment_log.visible_patches,
+            visual_alignment_log.occluded_patches,
             visual_alignment_log.initial_rmse,
             visual_alignment_log.final_rmse,
             visual_alignment_log.translation_correction_m,
             visual_alignment_log.rotation_correction_deg,
-            visual_alignment_log.landmarks,
-            visual_alignment_log.new_landmarks,
+            visual_alignment_log.keyframe_frame_index,
+            visual_alignment_log.keyframe_age_frames,
+            visual_alignment_log.keyframe_points,
+            visual_alignment_log.visible_ratio,
+            visual_alignment_log.consecutive_failures,
+            visual_alignment_log.keyframe_event,
+            visual_alignment_log.new_keyframe_points,
             duration_ms(visual_alignment_time),
         );
         // Keep geometric filtering and map insertion at the SAME final pose.
