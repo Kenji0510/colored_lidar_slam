@@ -72,6 +72,22 @@ pub struct SurfaceFilterConfig {
     pub max_center_distance_m: f32,
 }
 
+/// 平面判定で Planar / NonPlanar が確定したセルの記録。
+///
+/// GlobalMap は新しい観測が入ったセルの判定をいったん Unknown に戻すため、ある時点の
+/// `surface_status` だけでは「最後に確定した平面」が分からない。記録を有効にした
+/// LOCALMap は判定のたびにここへ結果を溜め、利用側（キーフレーム貼り付けのコピーなど）が
+/// `take_surface_classification_log` で取り出す。Unknown（判定材料不足）は記録しない。
+#[derive(Debug, Clone, Copy)]
+pub struct SurfaceClassificationRecord {
+    pub key: VoxelKey,
+    /// 判定時点のセルの代表点。
+    pub mean: Point3<f32>,
+    pub status: SurfaceStatus,
+    /// `status == Planar` のときだけ Some。
+    pub plane: Option<SurfacePlane>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SurfaceClassificationStats {
     pub evaluated: usize,
@@ -208,6 +224,8 @@ pub struct LOCALMap {
     frame_voxel_scratch: FxHashMap<VoxelKey, (Vector3<f32>, usize)>,
     surface_filter_config: Option<SurfaceFilterConfig>,
     surface_evaluation_epoch: u64,
+    /// None なら記録しない（既定）。
+    surface_classification_log: Option<Vec<SurfaceClassificationRecord>>,
 }
 
 impl LOCALMap {
@@ -236,7 +254,25 @@ impl LOCALMap {
             frame_voxel_scratch: FxHashMap::default(),
             surface_filter_config: None,
             surface_evaluation_epoch: 0,
+            surface_classification_log: None,
         }
+    }
+
+    /// 平面判定の結果（Planar / NonPlanar）を記録するかどうか。無効にすると溜まった記録も捨てる。
+    pub fn set_surface_classification_log(&mut self, enabled: bool) {
+        if !enabled {
+            self.surface_classification_log = None;
+        } else if self.surface_classification_log.is_none() {
+            self.surface_classification_log = Some(Vec::new());
+        }
+    }
+
+    /// 前回取り出してから記録された平面判定の結果を、判定順に取り出す。
+    pub fn take_surface_classification_log(&mut self) -> Vec<SurfaceClassificationRecord> {
+        self.surface_classification_log
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     // 同一フレーム内の点をボクセルごとに平均し、
@@ -963,6 +999,16 @@ impl LOCALMap {
             cell.surface_plane = evaluation.plane;
             cell.surface_evaluation_epoch = evaluation_epoch;
             cell.surface_evaluated_through_frame_id = current_frame_id;
+            if let Some(log) = self.surface_classification_log.as_mut()
+                && evaluation.status != SurfaceStatus::Unknown
+            {
+                log.push(SurfaceClassificationRecord {
+                    key,
+                    mean: cell.mean,
+                    status: evaluation.status,
+                    plane: evaluation.plane,
+                });
+            }
             stats.evaluated += 1;
             match evaluation.status {
                 SurfaceStatus::Unknown => stats.unknown += 1,
@@ -2227,6 +2273,53 @@ mod tests {
             .unwrap();
         assert_eq!(cell.surface_status, SurfaceStatus::Unknown);
         assert_eq!(cell.surface_evaluated_through_frame_id, Some(2));
+    }
+
+    #[test]
+    fn classification_log_records_planar_and_non_planar_results_only_when_enabled() {
+        let mut map = LOCALMap::new(map_config());
+        insert_xy_plane(&mut map, true);
+        map.classify_all_surface_voxels(&surface_filter_config());
+        assert!(map.take_surface_classification_log().is_empty());
+
+        map.set_surface_classification_log(true);
+        let stats = map.classify_all_surface_voxels(&surface_filter_config());
+        let log = map.take_surface_classification_log();
+        assert_eq!(log.len(), stats.planar + stats.non_planar);
+        assert!(stats.planar > 0 && stats.non_planar > 0);
+        for record in &log {
+            let cell = &map.voxel_map[&record.key];
+            assert_eq!(record.status, cell.surface_status);
+            assert_eq!(record.mean, cell.mean);
+            assert_eq!(
+                record.plane.is_some(),
+                record.status == SurfaceStatus::Planar
+            );
+        }
+        // 取り出したら空になる
+        assert!(map.take_surface_classification_log().is_empty());
+
+        // 新しい観測でセルは Unknown に戻るが、記録はそのまま残る（取り出すまで）
+        map.classify_all_surface_voxels(&surface_filter_config());
+        map.update_world_map(&[Point3::new(0.01, 0.01, 0.0)], &Matrix4::identity());
+        let center = VoxelKey {
+            ix: 0,
+            iy: 0,
+            iz: 0,
+        };
+        assert_eq!(
+            map.voxel_map[&center].surface_status,
+            SurfaceStatus::Unknown
+        );
+        assert!(
+            map.take_surface_classification_log()
+                .iter()
+                .any(|record| record.key == center)
+        );
+
+        map.set_surface_classification_log(false);
+        map.classify_all_surface_voxels(&surface_filter_config());
+        assert!(map.take_surface_classification_log().is_empty());
     }
 
     #[test]

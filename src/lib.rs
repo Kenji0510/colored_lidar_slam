@@ -7,6 +7,7 @@ pub mod camera;
 pub mod color_map;
 pub mod find_nearest_points;
 pub mod icp;
+pub mod keyframe_paste;
 pub mod predict_pose_by_imu;
 pub mod types;
 pub mod visual_alignment;

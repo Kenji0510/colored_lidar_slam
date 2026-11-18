@@ -1183,6 +1183,14 @@ pub struct VisualFrame<'a> {
     pub planar_map: &'a VoxelMap,
 }
 
+/// 今のキーフレームの番号と、画像を撮った時刻のカメラ姿勢（作成時に確定した値）。
+#[derive(Debug, Clone, Copy)]
+pub struct KeyframePose {
+    pub frame_index: u64,
+    pub image_time: f64,
+    pub camera_from_world: Matrix4<f64>,
+}
+
 #[derive(Default)]
 pub struct VisualAligner {
     pub config: VisualAlignmentConfig,
@@ -1202,6 +1210,15 @@ impl VisualAligner {
     /// 今のキーフレームを作ったフレーム番号。
     pub fn keyframe_frame_index(&self) -> Option<u64> {
         self.keyframe.as_ref().map(|keyframe| keyframe.frame_index)
+    }
+
+    /// 今のキーフレームの番号・画像時刻・カメラ姿勢（キーフレーム画像の貼り付けに使う）。
+    pub fn keyframe_pose(&self) -> Option<KeyframePose> {
+        self.keyframe.as_ref().map(|keyframe| KeyframePose {
+            frame_index: keyframe.frame_index,
+            image_time: keyframe.image_time,
+            camera_from_world: keyframe.camera_from_world,
+        })
     }
 
     /// LiDAR 更新が採用されたフレームでだけ呼ぶ。色付けとマップ更新より前に呼ぶ。
@@ -1823,6 +1840,9 @@ mod tests {
 
         let keyframe = aligner.keyframe.as_ref().unwrap();
         assert_eq!(keyframe.frame_index, 0);
+        let pose = aligner.keyframe_pose().unwrap();
+        assert_eq!(pose.frame_index, 0);
+        assert_eq!(pose.camera_from_world, keyframe.camera_from_world);
         assert!(keyframe.points.len() >= aligner.config.min_keyframe_points);
         assert!(keyframe.points.len() <= aligner.config.max_keyframe_points);
         let cols = (camera.width as usize).div_ceil(aligner.config.grid_size_px);
