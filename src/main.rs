@@ -1118,6 +1118,12 @@ fn main() -> Result<()> {
             visual_alignment_log.new_keyframe_points,
             duration_ms(visual_alignment_time),
         );
+        // 画像位置合わせと LiDAR 点群位置合わせ (ICP) の RMSE を横並びで表示する。
+        log::info!(
+            "Frame {i}: RMSE | {} | {}",
+            format_visual_rmse(&visual_alignment_log),
+            format_lidar_rmse(icp_ok, final_rmse),
+        );
 
         // --- Keyframe paste: register a newly confirmed keyframe ---
         // このフレームで新しいキーフレーム（N+1）ができたら、その画像と確定姿勢を保持し、
@@ -1592,6 +1598,7 @@ fn main() -> Result<()> {
     }
 
     log_timing_summary(&frame_logs);
+    log_rmse_summary(&frame_logs);
 
     // キーフレーム貼り付け用の判定記録はここまで。終端の全セル再判定は記録せず
     // （全セル分の記録はメモリを食うため）、再判定後のマップから直接コピーへ反映する。
@@ -1865,6 +1872,120 @@ fn log_keyframe_paste(context: &str, stats: &PasteStats) {
         stats.target_cells,
         stats.occluder_cells,
     );
+}
+
+/// 画像位置合わせの RMSE（輝度 0..255、パッチ平均除去後）を `初期->最終 (status)` で表す。
+fn format_visual_rmse(log: &VisualAlignmentLog) -> String {
+    match (log.initial_rmse, log.final_rmse) {
+        (Some(initial), Some(final_rmse)) => format!(
+            "image RMSE = {initial:>7.3} -> {final_rmse:>7.3} [gray] ({}{})",
+            log.status,
+            if log.update_applied { ", applied" } else { "" },
+        ),
+        _ => format!("image RMSE = {:>18} ({})", "-", log.status),
+    }
+}
+
+/// LiDAR 点群位置合わせ (Point-to-Plane ICP) の最終 RMSE [m] を表す。
+fn format_lidar_rmse(icp_ok: bool, rmse: Option<f32>) -> String {
+    let status = if icp_ok { "ok" } else { "rejected" };
+    match rmse.filter(|value| value.is_finite()) {
+        Some(value) => format!("LiDAR RMSE = {value:>8.5} [m] ({status})"),
+        None => format!("LiDAR RMSE = {:>8} ({status})", "-"),
+    }
+}
+
+/// 値列の mean / median / max を返す（空なら None）。
+fn rmse_stats(mut values: Vec<f64>) -> Option<(f64, f64, f64)> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let mid = values.len() / 2;
+    let median = if values.len() % 2 == 0 {
+        0.5 * (values[mid - 1] + values[mid])
+    } else {
+        values[mid]
+    };
+    Some((mean, median, values[values.len() - 1]))
+}
+
+fn format_rmse_stats(stats: Option<(f64, f64, f64)>, count: usize, precision: usize) -> String {
+    match stats {
+        Some((mean, median, max)) => format!(
+            "n={count:<5} mean={mean:.precision$} median={median:.precision$} max={max:.precision$}"
+        ),
+        None => format!("n={count:<5} (no data)"),
+    }
+}
+
+/// 全フレームの画像位置合わせ RMSE と LiDAR 位置合わせ RMSE を横並びで集計表示する。
+fn log_rmse_summary(frame_logs: &[FrameLog]) {
+    if frame_logs.is_empty() {
+        return;
+    }
+    let visual_initial: Vec<f64> = frame_logs
+        .iter()
+        .filter_map(|log| log.visual_alignment.initial_rmse)
+        .filter(|value| value.is_finite())
+        .collect();
+    let visual_final: Vec<f64> = frame_logs
+        .iter()
+        .filter_map(|log| log.visual_alignment.final_rmse)
+        .filter(|value| value.is_finite())
+        .collect();
+    let visual_applied: Vec<f64> = frame_logs
+        .iter()
+        .filter(|log| log.visual_alignment.update_applied)
+        .filter_map(|log| log.visual_alignment.final_rmse)
+        .filter(|value| value.is_finite())
+        .collect();
+    let lidar_all: Vec<f64> = frame_logs
+        .iter()
+        .filter_map(|log| log.rmse)
+        .map(f64::from)
+        .collect();
+    let lidar_ok: Vec<f64> = frame_logs
+        .iter()
+        .filter(|log| log.icp_ok)
+        .filter_map(|log| log.rmse)
+        .map(f64::from)
+        .collect();
+
+    let rows = [
+        (
+            "initial (all evaluated)",
+            format_rmse_stats(rmse_stats(visual_initial.clone()), visual_initial.len(), 3),
+            "final (all evaluated)",
+            format_rmse_stats(rmse_stats(lidar_all.clone()), lidar_all.len(), 5),
+        ),
+        (
+            "final (all evaluated)",
+            format_rmse_stats(rmse_stats(visual_final.clone()), visual_final.len(), 3),
+            "final (icp_ok)",
+            format_rmse_stats(rmse_stats(lidar_ok.clone()), lidar_ok.len(), 5),
+        ),
+        (
+            "final (update applied)",
+            format_rmse_stats(rmse_stats(visual_applied.clone()), visual_applied.len(), 3),
+            "",
+            String::new(),
+        ),
+    ];
+    log::info!(
+        "RMSE summary for {} frames: image alignment [gray 0..255] | LiDAR ICP [m]",
+        frame_logs.len(),
+    );
+    for (visual_label, visual, lidar_label, lidar) in rows {
+        log::info!(
+            "  image {:<23} {:<55} | LiDAR {:<21} {}",
+            visual_label,
+            visual,
+            lidar_label,
+            lidar,
+        );
+    }
 }
 
 #[derive(Debug)]
