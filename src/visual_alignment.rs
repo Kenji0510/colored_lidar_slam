@@ -99,12 +99,12 @@ impl Default for VisualAlignmentConfig {
             max_consecutive_failures: 5,
             min_patches: 20,
             max_iterations_per_level: 5,
-            patch_sigma: 10.0,
+            patch_sigma: 5.0,
             huber_delta: 10.0,
             max_initial_patch_rmse: 45.0,
-            max_final_rmse: 25.0,
-            max_translation_correction_m: 0.05,
-            max_rotation_correction_deg: 0.5,
+            max_final_rmse: 30.0,
+            max_translation_correction_m: 0.10,
+            max_rotation_correction_deg: 1.0,
         }
     }
 }
@@ -1119,14 +1119,24 @@ fn optimize(
     report.initial_rmse = Some(initial.rmse());
     report.final_rmse = Some(final_system.rmse());
     let (translation, rotation) = correction(&prior_state, &state, observation.filter);
-    if !final_system.cost.is_finite()
-        || final_system.rmse() > config.max_final_rmse
-        || final_system.cost + prior_cost(&state) > initial.cost + 1e-9
-        || final_system.squared_error > initial.squared_error + 1e-6
-        || translation > config.max_translation_correction_m
-        || rotation > config.max_rotation_correction_deg
-    {
-        report.status = "rejected".into();
+    // 棄却理由をステータスに残す（どのしきい値が効いているかをログから判断するため）。
+    let rejection_reason = if !final_system.cost.is_finite() {
+        Some("non_finite_cost")
+    } else if final_system.rmse() > config.max_final_rmse {
+        Some("final_rmse")
+    } else if final_system.cost + prior_cost(&state) > initial.cost + 1e-9 {
+        Some("cost_increased")
+    } else if final_system.squared_error > initial.squared_error + 1e-6 {
+        Some("error_increased")
+    } else if translation > config.max_translation_correction_m {
+        Some("translation_limit")
+    } else if rotation > config.max_rotation_correction_deg {
+        Some("rotation_limit")
+    } else {
+        None
+    };
+    if let Some(reason) = rejection_reason {
+        report.status = format!("rejected:{reason}");
         return false;
     }
     if state.boxminus(&prior_state).norm() < 1e-10 {
@@ -2325,7 +2335,7 @@ mod tests {
                 &points,
                 &map,
             );
-            assert_eq!(report.status, "rejected", "{report:?}");
+            assert_eq!(report.status, "rejected:final_rmse", "{report:?}");
             assert_eq!(report.consecutive_failures, frame_index as u32);
             assert_eq!(report.keyframe_event, "none");
             assert_eq!(filter.state, state);
@@ -2341,7 +2351,7 @@ mod tests {
             &points,
             &map,
         );
-        assert_eq!(report.status, "rejected");
+        assert_eq!(report.status, "rejected:final_rmse");
         assert_eq!(
             report.keyframe_event, "created:reset_after_failures",
             "{report:?}"

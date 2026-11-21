@@ -35,7 +35,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/01";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/02";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
 const SAVE_ROOT_DIR: &str = "data/output/11142026";
 
@@ -1100,6 +1100,12 @@ fn main() -> Result<()> {
             visual_alignment_log.new_keyframe_points,
             duration_ms(visual_alignment_time),
         );
+        // 画像位置合わせと LiDAR 点群位置合わせ (ICP) の RMSE を横並びで表示する。
+        log::info!(
+            "Frame {i}: RMSE | {} | {}",
+            format_visual_rmse(&visual_alignment_log),
+            format_lidar_rmse(icp_ok, final_rmse),
+        );
         // Keep geometric filtering and map insertion at the SAME final pose.
         let final_lidar_pose = filter.lidar_pose().cast::<f32>();
         r_mat = final_lidar_pose.fixed_view::<3, 3>(0, 0).into_owned();
@@ -1527,6 +1533,7 @@ fn main() -> Result<()> {
     }
 
     log_timing_summary(&frame_logs);
+    log_rmse_summary(&frame_logs);
 
     // --- Save the global voxel maps before and after final plane classification ---
     let min_samples = slam_map.global_voxel_map.config.min_points_per_voxel as u64;
@@ -1702,6 +1709,167 @@ fn main() -> Result<()> {
 #[inline]
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+/// 画像位置合わせの RMSE（輝度 0..255、パッチ平均除去後）を `初期->最終 (status)` で表す。
+fn format_visual_rmse(log: &VisualAlignmentLog) -> String {
+    match (log.initial_rmse, log.final_rmse) {
+        (Some(initial), Some(final_rmse)) => format!(
+            "image RMSE = {initial:>7.3} -> {final_rmse:>7.3} [gray] ({}{})",
+            log.status,
+            if log.update_applied { ", applied" } else { "" },
+        ),
+        _ => format!("image RMSE = {:>18} ({})", "-", log.status),
+    }
+}
+
+/// LiDAR 点群位置合わせ (Point-to-Plane ICP) の最終 RMSE [m] を表す。
+fn format_lidar_rmse(icp_ok: bool, rmse: Option<f32>) -> String {
+    let status = if icp_ok { "ok" } else { "rejected" };
+    match rmse.filter(|value| value.is_finite()) {
+        Some(value) => format!("LiDAR RMSE = {value:>8.5} [m] ({status})"),
+        None => format!("LiDAR RMSE = {:>8} ({status})", "-"),
+    }
+}
+
+/// 値列の mean / median / max を返す（空なら None）。
+fn rmse_stats(mut values: Vec<f64>) -> Option<(f64, f64, f64)> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let mid = values.len() / 2;
+    let median = if values.len() % 2 == 0 {
+        0.5 * (values[mid - 1] + values[mid])
+    } else {
+        values[mid]
+    };
+    Some((mean, median, values[values.len() - 1]))
+}
+
+fn format_rmse_stats(values: &[f64], precision: usize) -> String {
+    match rmse_stats(values.to_vec()) {
+        Some((mean, median, max)) => format!(
+            "n={:<5} mean={mean:.precision$} median={median:.precision$} max={max:.precision$}",
+            values.len()
+        ),
+        None => format!("n={:<5} (no data)", values.len()),
+    }
+}
+
+/// 全フレームの画像位置合わせ RMSE と LiDAR 位置合わせ RMSE を横並びで集計表示する。
+fn log_rmse_summary(frame_logs: &[FrameLog]) {
+    if frame_logs.is_empty() {
+        return;
+    }
+    let finite = |value: &f64| value.is_finite();
+    let visual_initial: Vec<f64> = frame_logs
+        .iter()
+        .filter_map(|log| log.visual_alignment.initial_rmse)
+        .filter(finite)
+        .collect();
+    let visual_final: Vec<f64> = frame_logs
+        .iter()
+        .filter_map(|log| log.visual_alignment.final_rmse)
+        .filter(finite)
+        .collect();
+    let visual_applied_initial: Vec<f64> = frame_logs
+        .iter()
+        .filter(|log| log.visual_alignment.update_applied)
+        .filter_map(|log| log.visual_alignment.initial_rmse)
+        .filter(finite)
+        .collect();
+    let visual_applied_final: Vec<f64> = frame_logs
+        .iter()
+        .filter(|log| log.visual_alignment.update_applied)
+        .filter_map(|log| log.visual_alignment.final_rmse)
+        .filter(finite)
+        .collect();
+    let lidar_all: Vec<f64> = frame_logs
+        .iter()
+        .filter_map(|log| log.rmse)
+        .map(f64::from)
+        .collect();
+    let lidar_ok: Vec<f64> = frame_logs
+        .iter()
+        .filter(|log| log.icp_ok)
+        .filter_map(|log| log.rmse)
+        .map(f64::from)
+        .collect();
+
+    let rows = [
+        (
+            "initial (all evaluated)",
+            format_rmse_stats(&visual_initial, 3),
+            "final (all evaluated)",
+            format_rmse_stats(&lidar_all, 5),
+        ),
+        (
+            "final (all evaluated)",
+            format_rmse_stats(&visual_final, 3),
+            "final (icp_ok)",
+            format_rmse_stats(&lidar_ok, 5),
+        ),
+        (
+            "initial (update applied)",
+            format_rmse_stats(&visual_applied_initial, 3),
+            "",
+            String::new(),
+        ),
+        (
+            "final (update applied)",
+            format_rmse_stats(&visual_applied_final, 3),
+            "",
+            String::new(),
+        ),
+    ];
+    log::info!(
+        "RMSE summary for {} frames: image alignment [gray 0..255] | LiDAR ICP [m]",
+        frame_logs.len(),
+    );
+    for (visual_label, visual, lidar_label, lidar) in rows {
+        log::info!(
+            "  image {:<24} {:<55} | LiDAR {:<21} {}",
+            visual_label,
+            visual,
+            lidar_label,
+            lidar,
+        );
+    }
+
+    // 画像位置合わせのステータス別件数（棄却理由の内訳を含む）。
+    let mut status_counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for log in frame_logs {
+        *status_counts
+            .entry(log.visual_alignment.status.as_str())
+            .or_default() += 1;
+    }
+    let status_text = status_counts
+        .iter()
+        .map(|(status, count)| format!("{status}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    log::info!("  image status: {status_text}");
+
+    // 実際に反映された画像補正量の分布。
+    let applied: Vec<&FrameLog> = frame_logs
+        .iter()
+        .filter(|log| log.visual_alignment.update_applied)
+        .collect();
+    let translation: Vec<f64> = applied
+        .iter()
+        .map(|log| log.visual_alignment.translation_correction_m)
+        .collect();
+    let rotation: Vec<f64> = applied
+        .iter()
+        .map(|log| log.visual_alignment.rotation_correction_deg)
+        .collect();
+    log::info!(
+        "  image correction (applied): translation [m] {} | rotation [deg] {}",
+        format_rmse_stats(&translation, 5),
+        format_rmse_stats(&rotation, 4),
+    );
 }
 
 #[derive(Debug)]
