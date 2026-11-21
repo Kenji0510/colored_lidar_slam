@@ -20,8 +20,8 @@ use re_lidar_slam::{
     },
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory},
     types::{
-        CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, PointXYZRGB, SLAMMap,
-        VisualAlignmentLog,
+        CurrentFrameInfo, FrameLog, FrameTiming, IMU, ImageFrameMetadata, PointXYZ, PointXYZRGB,
+        SLAMMap, VisualAlignmentLog,
     },
     visual_alignment::{VisualAligner, VisualAlignmentConfig, VisualFrame},
     voxel_map::{
@@ -95,9 +95,51 @@ impl LidarModel {
     }
 }
 
+/// 画像タイムスタンプに足す時刻オフセットの既定値 [s]。
+/// FAST-LIVO2 の `time_offset/img_time_offset` と同じく、画像ヘッダ時刻 + offset を
+/// LiDAR/IMU 時刻系での撮像時刻とみなす。
+const DEFAULT_IMAGE_TIME_OFFSET_SEC: f64 = 0.1;
+/// 誤入力（ms を秒として渡す等）を弾くための上限 [s]。
+const MAX_ABS_IMAGE_TIME_OFFSET_SEC: f64 = 1.0;
+
+#[derive(Debug, Clone, PartialEq)]
+struct RunOptions {
+    lidar_model: LidarModel,
+    visual_alignment_enabled: bool,
+    /// 画像タイムスタンプに足す時刻オフセット [s]。
+    image_time_offset_sec: f64,
+    /// 出力先を `<SAVE_ROOT_DIR>/<lidar>_<tag>` に分ける（比較実行で上書きしないため）。
+    output_tag: Option<String>,
+}
+
 enum CommandLineAction {
-    Run(LidarModel, bool),
+    Run(RunOptions),
     Help,
+}
+
+fn parse_image_time_offset(value: &str) -> Result<f64> {
+    let offset: f64 = value
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--image-time-offset requires seconds, e.g. 0.1 or -0.02"))?;
+    if !offset.is_finite() || offset.abs() > MAX_ABS_IMAGE_TIME_OFFSET_SEC {
+        bail!(
+            "--image-time-offset must be finite and within ±{MAX_ABS_IMAGE_TIME_OFFSET_SEC} s \
+             (got {value})"
+        );
+    }
+    Ok(offset)
+}
+
+fn parse_output_tag(value: &str) -> Result<String> {
+    let valid = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'));
+    if !valid || value.starts_with('.') {
+        bail!("--output-tag must be non-empty and use only [A-Za-z0-9._+-] (got '{value}')");
+    }
+    Ok(value.to_string())
 }
 
 fn parse_command_line<I>(args: I) -> Result<CommandLineAction>
@@ -106,7 +148,15 @@ where
 {
     let mut lidar_model = LidarModel::Mid70;
     let mut visual_alignment_enabled = true;
+    let mut image_time_offset_sec = DEFAULT_IMAGE_TIME_OFFSET_SEC;
+    let mut output_tag = None;
     let mut args = args.into_iter();
+    let mut next_value = |args: &mut I::IntoIter, name: &str| -> Result<String> {
+        args.next()
+            .ok_or_else(|| anyhow::anyhow!("{name} requires a value"))?
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("{name} value must be valid UTF-8"))
+    };
 
     while let Some(argument) = args.next() {
         let argument = argument
@@ -117,32 +167,53 @@ where
             "-h" | "--help" => return Ok(CommandLineAction::Help),
             "--no-visual-alignment" => visual_alignment_enabled = false,
             "--lidar" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("--lidar requires 'mid70', 'airy96', or 'avia'")
-                    })?
-                    .into_string()
-                    .map_err(|_| anyhow::anyhow!("LiDAR model must be valid UTF-8"))?;
+                let value = next_value(&mut args, "--lidar")
+                    .map_err(|_| anyhow::anyhow!("--lidar requires 'mid70', 'airy96', or 'avia'"))?;
                 lidar_model = LidarModel::parse(&value)?;
             }
             _ if argument.starts_with("--lidar=") => {
                 lidar_model = LidarModel::parse(&argument["--lidar=".len()..])?;
             }
+            "--image-time-offset" => {
+                let value = next_value(&mut args, "--image-time-offset")?;
+                image_time_offset_sec = parse_image_time_offset(&value)?;
+            }
+            _ if argument.starts_with("--image-time-offset=") => {
+                image_time_offset_sec =
+                    parse_image_time_offset(&argument["--image-time-offset=".len()..])?;
+            }
+            "--output-tag" => {
+                output_tag = Some(parse_output_tag(&next_value(&mut args, "--output-tag")?)?);
+            }
+            _ if argument.starts_with("--output-tag=") => {
+                output_tag = Some(parse_output_tag(&argument["--output-tag=".len()..])?);
+            }
             _ => bail!("unknown argument '{argument}'; use --help for usage"),
         }
     }
 
-    Ok(CommandLineAction::Run(
+    Ok(CommandLineAction::Run(RunOptions {
         lidar_model,
         visual_alignment_enabled,
-    ))
+        image_time_offset_sec,
+        output_tag,
+    }))
 }
 
 fn print_usage() {
-    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>] [--no-visual-alignment]");
+    println!(
+        "Usage: re_lidar_slam [--lidar <mid70|airy96|avia>] [--no-visual-alignment] \
+         [--image-time-offset <sec>] [--output-tag <name>]"
+    );
     println!("  --lidar  Select the point-cloud sensor (default: mid70)");
     println!("  --no-visual-alignment  Disable the keyframe-based 9x9 visual ESIKF update");
+    println!(
+        "  --image-time-offset <sec>  Add this offset to every image timestamp before image \
+         selection, coloring and visual alignment (default: {DEFAULT_IMAGE_TIME_OFFSET_SEC:+} s)"
+    );
+    println!(
+        "  --output-tag <name>  Save results under <output>/<lidar>_<name> instead of <lidar>"
+    );
 }
 
 // Mid-70 sparse-cloud preset.
@@ -360,6 +431,12 @@ fn initialize_eskf(
     Eskf::new(initial_state, config, imu_model, imu_origin_in_lidar_frame)
 }
 
+fn apply_image_time_offset(frames: &mut [ImageFrameMetadata], offset_sec: f64) {
+    for frame in frames {
+        frame.timestamp_sec += offset_sec;
+    }
+}
+
 fn count_imu_samples_in_time_range(imu_data: &[IMU], start_time: f64, end_time: f64) -> usize {
     if !start_time.is_finite() || !end_time.is_finite() || start_time > end_time {
         return 0;
@@ -374,16 +451,23 @@ fn count_imu_samples_in_time_range(imu_data: &[IMU], start_time: f64, end_time: 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
-    let (lidar_model, visual_alignment_enabled) =
-        match parse_command_line(std::env::args_os().skip(1))? {
-            CommandLineAction::Run(lidar_model, enabled) => (lidar_model, enabled),
-            CommandLineAction::Help => {
-                print_usage();
-                return Ok(());
-            }
-        };
+    let RunOptions {
+        lidar_model,
+        visual_alignment_enabled,
+        image_time_offset_sec,
+        output_tag,
+    } = match parse_command_line(std::env::args_os().skip(1))? {
+        CommandLineAction::Run(options) => options,
+        CommandLineAction::Help => {
+            print_usage();
+            return Ok(());
+        }
+    };
     let load_dir = format!("{DATASET_DIR}/{}", lidar_model.input_subdir());
-    let save_dir = format!("{SAVE_ROOT_DIR}/{}", lidar_model.name());
+    let save_dir = match &output_tag {
+        Some(tag) => format!("{SAVE_ROOT_DIR}/{}_{tag}", lidar_model.name()),
+        None => format!("{SAVE_ROOT_DIR}/{}", lidar_model.name()),
+    };
     let imu_to_lidar = lidar_model.imu_to_lidar_rotation();
     let imu_origin_in_lidar_frame = lidar_model.imu_origin_in_lidar_frame_m();
     log::info!(
@@ -410,7 +494,16 @@ fn main() -> Result<()> {
 
     let image_meta_dir = format!("{DATASET_DIR}/camera");
     let image_meta_file = format!("{}/frames.json", image_meta_dir);
-    let image_meta = load_image_meta(&image_meta_file)?;
+    let mut image_meta = load_image_meta(&image_meta_file)?;
+    // 画像ヘッダ時刻 + offset を撮像時刻とみなす。以後の画像選択・色付け・画像位置合わせ・
+    // キーフレームはすべてこの補正後の時刻を使う。
+    apply_image_time_offset(&mut image_meta.frames, image_time_offset_sec);
+    log::info!(
+        "Image time offset = {:+.6} s ({:+.3} ms) applied to {} image timestamps",
+        image_time_offset_sec,
+        image_time_offset_sec * 1000.0,
+        image_meta.frames.len(),
+    );
     // <--- Loading each data --->
 
     // <--- Initialize current frame info --->
@@ -1100,6 +1193,12 @@ fn main() -> Result<()> {
             visual_alignment_log.new_keyframe_points,
             duration_ms(visual_alignment_time),
         );
+        // 画像位置合わせと LiDAR 点群位置合わせ (ICP) の RMSE を横並びで表示する。
+        log::info!(
+            "Frame {i}: RMSE | {} | {}",
+            format_visual_rmse(&visual_alignment_log),
+            format_lidar_rmse(icp_ok, final_rmse),
+        );
         // Keep geometric filtering and map insertion at the SAME final pose.
         let final_lidar_pose = filter.lidar_pose().cast::<f32>();
         r_mat = final_lidar_pose.fixed_view::<3, 3>(0, 0).into_owned();
@@ -1527,6 +1626,7 @@ fn main() -> Result<()> {
     }
 
     log_timing_summary(&frame_logs);
+    log_rmse_summary(&frame_logs, image_time_offset_sec);
 
     // --- Save the global voxel maps before and after final plane classification ---
     let min_samples = slam_map.global_voxel_map.config.min_points_per_voxel as u64;
@@ -1702,6 +1802,181 @@ fn main() -> Result<()> {
 #[inline]
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+/// 画像位置合わせの RMSE（輝度 0..255、パッチ平均除去後）を `初期->最終 (status)` で表す。
+fn format_visual_rmse(log: &VisualAlignmentLog) -> String {
+    match (log.initial_rmse, log.final_rmse) {
+        (Some(initial), Some(final_rmse)) => format!(
+            "image RMSE = {initial:>7.3} -> {final_rmse:>7.3} [gray] ({}{})",
+            log.status,
+            if log.update_applied { ", applied" } else { "" },
+        ),
+        _ => format!("image RMSE = {:>18} ({})", "-", log.status),
+    }
+}
+
+/// LiDAR 点群位置合わせ (Point-to-Plane ICP) の最終 RMSE [m] を表す。
+fn format_lidar_rmse(icp_ok: bool, rmse: Option<f32>) -> String {
+    let status = if icp_ok { "ok" } else { "rejected" };
+    match rmse.filter(|value| value.is_finite()) {
+        Some(value) => format!("LiDAR RMSE = {value:>8.5} [m] ({status})"),
+        None => format!("LiDAR RMSE = {:>8} ({status})", "-"),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValueStats {
+    mean: f64,
+    median: f64,
+    max: f64,
+}
+
+/// 値列の mean / median / max を返す（空なら None）。
+fn value_stats(values: &[f64]) -> Option<ValueStats> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    let median = if sorted.len() % 2 == 0 {
+        0.5 * (sorted[mid - 1] + sorted[mid])
+    } else {
+        sorted[mid]
+    };
+    Some(ValueStats {
+        mean: sorted.iter().sum::<f64>() / sorted.len() as f64,
+        median,
+        max: sorted[sorted.len() - 1],
+    })
+}
+
+fn format_value_stats(values: &[f64], precision: usize) -> String {
+    match value_stats(values) {
+        Some(ValueStats { mean, median, max }) => format!(
+            "n={:<5} mean={mean:.precision$} median={median:.precision$} max={max:.precision$}",
+            values.len()
+        ),
+        None => format!("n={:<5} (no data)", values.len()),
+    }
+}
+
+/// 全フレームの画像位置合わせ RMSE と LiDAR 位置合わせ RMSE を横並びで集計表示する。
+/// 最後の `Image time offset evaluation:` 行は、オフセット掃引で比較するための 1 行要約。
+fn log_rmse_summary(frame_logs: &[FrameLog], image_time_offset_sec: f64) {
+    if frame_logs.is_empty() {
+        return;
+    }
+    let collect = |applied_only: bool, get: fn(&VisualAlignmentLog) -> Option<f64>| -> Vec<f64> {
+        frame_logs
+            .iter()
+            .map(|log| &log.visual_alignment)
+            .filter(|visual| !applied_only || visual.update_applied)
+            .filter_map(get)
+            .filter(|value| value.is_finite())
+            .collect()
+    };
+    let visual_initial = collect(false, |v| v.initial_rmse);
+    let visual_final = collect(false, |v| v.final_rmse);
+    let visual_applied_initial = collect(true, |v| v.initial_rmse);
+    let visual_applied_final = collect(true, |v| v.final_rmse);
+    let translation = collect(true, |v| Some(v.translation_correction_m));
+    let rotation = collect(true, |v| Some(v.rotation_correction_deg));
+    let lidar_all: Vec<f64> = frame_logs
+        .iter()
+        .filter_map(|log| log.rmse)
+        .map(f64::from)
+        .collect();
+    let lidar_ok: Vec<f64> = frame_logs
+        .iter()
+        .filter(|log| log.icp_ok)
+        .filter_map(|log| log.rmse)
+        .map(f64::from)
+        .collect();
+
+    let rows = [
+        (
+            "initial (all evaluated)",
+            format_value_stats(&visual_initial, 3),
+            "final (all evaluated)",
+            format_value_stats(&lidar_all, 5),
+        ),
+        (
+            "final (all evaluated)",
+            format_value_stats(&visual_final, 3),
+            "final (icp_ok)",
+            format_value_stats(&lidar_ok, 5),
+        ),
+        (
+            "initial (update applied)",
+            format_value_stats(&visual_applied_initial, 3),
+            "",
+            String::new(),
+        ),
+        (
+            "final (update applied)",
+            format_value_stats(&visual_applied_final, 3),
+            "",
+            String::new(),
+        ),
+    ];
+    log::info!(
+        "RMSE summary for {} frames (image time offset {:+.3} ms): \
+         image alignment [gray 0..255] | LiDAR ICP [m]",
+        frame_logs.len(),
+        image_time_offset_sec * 1000.0,
+    );
+    for (visual_label, visual, lidar_label, lidar) in rows {
+        log::info!(
+            "  image {:<24} {:<55} | LiDAR {:<21} {}",
+            visual_label,
+            visual,
+            lidar_label,
+            lidar,
+        );
+    }
+
+    let mut status_counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for log in frame_logs {
+        *status_counts
+            .entry(log.visual_alignment.status.as_str())
+            .or_default() += 1;
+    }
+    let status_text = status_counts
+        .iter()
+        .map(|(status, count)| format!("{status}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    log::info!("  image status: {status_text}");
+    log::info!(
+        "  image correction (applied): translation [m] {} | rotation [deg] {}",
+        format_value_stats(&translation, 5),
+        format_value_stats(&rotation, 4),
+    );
+
+    // オフセット掃引用の 1 行要約（key=value, 欠損は nan）。
+    let mean = |values: &[f64]| value_stats(values).map_or(f64::NAN, |s| s.mean);
+    let median = |values: &[f64]| value_stats(values).map_or(f64::NAN, |s| s.median);
+    log::info!(
+        "Image time offset evaluation: offset_ms={:.3} lidar_rmse_mean_m={:.6} \
+         lidar_rmse_median_m={:.6} image_initial_rmse_mean={:.4} image_initial_rmse_median={:.4} \
+         image_final_rmse_mean={:.4} image_evaluated={} image_applied={} \
+         correction_t_median_m={:.6} correction_t_mean_m={:.6} \
+         correction_r_median_deg={:.5} correction_r_mean_deg={:.5}",
+        image_time_offset_sec * 1000.0,
+        mean(&lidar_ok),
+        median(&lidar_ok),
+        mean(&visual_initial),
+        median(&visual_initial),
+        mean(&visual_final),
+        visual_initial.len(),
+        visual_applied_final.len(),
+        median(&translation),
+        mean(&translation),
+        median(&rotation),
+        mean(&rotation),
+    );
 }
 
 #[derive(Debug)]
@@ -1939,7 +2214,8 @@ mod tests {
     use nalgebra::{Point3, Vector3};
 
     use super::{
-        CommandLineAction, IMU, LidarModel, MID70_ORIGIN_IN_AIRY96_Z_M,
+        CommandLineAction, DEFAULT_IMAGE_TIME_OFFSET_SEC, IMU, ImageFrameMetadata, LidarModel,
+        MID70_ORIGIN_IN_AIRY96_Z_M, RunOptions, apply_image_time_offset, value_stats,
         count_imu_samples_in_time_range, make_airy96_from_mid70_extrinsic,
         make_imu_to_airy96_rotation, make_imu_to_avia_rotation, make_imu_to_mid70_rotation,
         parse_command_line, retain_world_z_translation,
@@ -1969,32 +2245,40 @@ mod tests {
 
     #[test]
     fn command_line_defaults_to_mid70() {
-        let CommandLineAction::Run(model, enabled) = parse_args(&[]).unwrap() else {
+        let CommandLineAction::Run(options) = parse_args(&[]).unwrap() else {
             panic!("expected run action");
         };
-        assert_eq!(model, LidarModel::Mid70);
-        assert!(enabled);
+        assert_eq!(options.lidar_model, LidarModel::Mid70);
+        assert!(options.visual_alignment_enabled);
+        assert_eq!(options.image_time_offset_sec, DEFAULT_IMAGE_TIME_OFFSET_SEC);
+        assert_eq!(options.output_tag, None);
     }
 
     #[test]
     fn command_line_can_disable_visual_alignment_for_comparison() {
-        let CommandLineAction::Run(model, enabled) =
+        let CommandLineAction::Run(options) =
             parse_args(&["--lidar", "avia", "--no-visual-alignment"]).unwrap()
         else {
             panic!("expected run action");
         };
-        assert_eq!(model, LidarModel::Avia);
-        assert!(!enabled);
+        assert_eq!(options.lidar_model, LidarModel::Avia);
+        assert!(!options.visual_alignment_enabled);
     }
 
     #[test]
     fn command_line_selects_airy96() {
-        let CommandLineAction::Run(model, _) = parse_args(&["--lidar", "airy96"]).unwrap() else {
+        let CommandLineAction::Run(RunOptions {
+            lidar_model: model, ..
+        }) = parse_args(&["--lidar", "airy96"]).unwrap()
+        else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Airy96);
 
-        let CommandLineAction::Run(model, _) = parse_args(&["--lidar=airy"]).unwrap() else {
+        let CommandLineAction::Run(RunOptions {
+            lidar_model: model, ..
+        }) = parse_args(&["--lidar=airy"]).unwrap()
+        else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Airy96);
@@ -2002,17 +2286,86 @@ mod tests {
 
     #[test]
     fn command_line_selects_avia() {
-        let CommandLineAction::Run(model, _) = parse_args(&["--lidar", "avia"]).unwrap() else {
+        let CommandLineAction::Run(RunOptions {
+            lidar_model: model, ..
+        }) = parse_args(&["--lidar", "avia"]).unwrap()
+        else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Avia);
         assert_eq!(model.input_subdir(), "avia");
         assert_eq!(model.name(), "avia");
 
-        let CommandLineAction::Run(model, _) = parse_args(&["--lidar=livox-avia"]).unwrap() else {
+        let CommandLineAction::Run(RunOptions {
+            lidar_model: model, ..
+        }) = parse_args(&["--lidar=livox-avia"]).unwrap()
+        else {
             panic!("expected run action");
         };
         assert_eq!(model, LidarModel::Avia);
+    }
+
+    #[test]
+    fn command_line_sets_image_time_offset_and_output_tag() {
+        let CommandLineAction::Run(options) = parse_args(&[
+            "--image-time-offset",
+            "-0.02",
+            "--output-tag",
+            "offset_m20ms",
+        ])
+        .unwrap() else {
+            panic!("expected run action");
+        };
+        assert_eq!(options.image_time_offset_sec, -0.02);
+        assert_eq!(options.output_tag.as_deref(), Some("offset_m20ms"));
+
+        let CommandLineAction::Run(options) =
+            parse_args(&["--image-time-offset=0", "--output-tag=a+10ms"]).unwrap()
+        else {
+            panic!("expected run action");
+        };
+        assert_eq!(options.image_time_offset_sec, 0.0);
+        assert_eq!(options.output_tag.as_deref(), Some("a+10ms"));
+    }
+
+    #[test]
+    fn command_line_rejects_invalid_image_time_offset_and_output_tag() {
+        for args in [
+            &["--image-time-offset"][..],
+            &["--image-time-offset", "abc"],
+            &["--image-time-offset", "NaN"],
+            &["--image-time-offset", "100"],
+            &["--output-tag", "../x"],
+            &["--output-tag", ""],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?} must fail");
+        }
+    }
+
+    #[test]
+    fn image_time_offset_shifts_every_timestamp() {
+        let frame = |timestamp_sec: f64| -> ImageFrameMetadata {
+            serde_json::from_value(serde_json::json!({
+                "frame_index": 0, "file_name": "x.png", "timestamp_ns": 0,
+                "timestamp_sec": timestamp_sec, "stamp": {"sec": 0, "nanosec": 0},
+                "frame_id": "camera", "width": 960, "height": 600,
+                "source_encoding": "rgb8", "source_step": 2880
+            }))
+            .unwrap()
+        };
+        let mut frames = vec![frame(1.0), frame(2.5)];
+        apply_image_time_offset(&mut frames, 0.1);
+        assert!((frames[0].timestamp_sec - 1.1).abs() < 1e-12);
+        assert!((frames[1].timestamp_sec - 2.6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn value_stats_reports_mean_median_and_max() {
+        let stats = value_stats(&[3.0, 1.0, 2.0, 10.0]).unwrap();
+        assert!((stats.mean - 4.0).abs() < 1e-12);
+        assert!((stats.median - 2.5).abs() < 1e-12);
+        assert_eq!(stats.max, 10.0);
+        assert!(value_stats(&[]).is_none());
     }
 
     #[test]
