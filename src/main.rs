@@ -4,6 +4,9 @@ use re_lidar_slam::{
     camera::{
         CameraIntrinsics, build_camera_from_lidar, colorize_world_points, project_camera_point,
     },
+    color_selection::{
+        ColorSelectionConfig, FrameColorInput, camera_motion_at, select_frame_colors,
+    },
     deskew_points::deskew_points,
     eskf::{
         Eskf, EskfConfig, ImuModel, ImuNoise, InitialStd, NavState, STANDARD_GRAVITY_MPS2,
@@ -20,8 +23,8 @@ use re_lidar_slam::{
     },
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory},
     types::{
-        CurrentFrameInfo, FrameLog, FrameTiming, IMU, ImageFrameMetadata, PointXYZ, PointXYZRGB,
-        SLAMMap, VisualAlignmentLog,
+        ColoringLog, CurrentFrameInfo, FrameLog, FrameTiming, IMU, ImageFrameMetadata, PointXYZ,
+        PointXYZRGB, SLAMMap, VisualAlignmentLog,
     },
     visual_alignment::{VisualAligner, VisualAlignmentConfig, VisualFrame},
     voxel_map::{
@@ -35,7 +38,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/01";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/02";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
 const SAVE_ROOT_DIR: &str = "data/output/11142026";
 
@@ -324,6 +327,10 @@ const MIN_IMU_SAMPLES_PER_POINT_CLOUD_FRAME: usize = 5;
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 150.0;
 
+// --- GlobalMap の色付け（ベストビュー方式、color_selection.rs） ---
+// 画像時刻のカメラ角速度は、この幅（±）の IMU の平均で求める [s]。
+const CAMERA_MOTION_HALF_WINDOW_S: f64 = 0.005;
+
 // --- ESKF ---
 // IMU ノイズ密度。データシート値（例: BMI088 はジャイロ約 2.4e-4 rad/s/√Hz、
 // 加速度約 1.7e-3 m/s²/√Hz）に、車体振動などの余裕として 5〜10 倍を掛けた値から始める。
@@ -579,6 +586,10 @@ fn main() -> Result<()> {
         -0.5,                            // pitch [deg]
         -1.0,                            // yaw [deg]
     );
+    // GlobalMap の各セルは、スコア（距離 × 角度 × 露光 × 鮮鋭さ）が最も高い 1 回の観測の色を持つ。
+    // 暗すぎる・ブレすぎる・白飛びの多い画像のフレームでは色を付けない。
+    let color_selection_config = ColorSelectionConfig::default();
+    log::info!("Color selection config: {color_selection_config:?}");
 
     //
     for (i, pcd_path) in pcd_files.iter().enumerate() {
@@ -1248,7 +1259,8 @@ fn main() -> Result<()> {
 
         // --- Colorize the registered frame ---
         let coloring_image_pose_start = Instant::now();
-        let lidar_pose_at_image_time: Option<Matrix4<f64>> =
+        // 画像時刻の名目状態と LiDAR 姿勢（状態はカメラの動き＝ブレ量の予測にも使う）。
+        let image_state_and_pose: Option<(NavState, Matrix4<f64>)> =
             if let (Some(metadata), Some(_)) = (selected_image, selected_rgb_image.as_ref()) {
                 let image_time = metadata.timestamp_sec;
 
@@ -1275,11 +1287,26 @@ fn main() -> Result<()> {
                         pose[(2, 3)],
                     );
 
-                    Some(pose)
+                    Some((image_state, pose))
                 }
             } else {
                 None
             };
+        let lidar_pose_at_image_time: Option<Matrix4<f64>> =
+            image_state_and_pose.as_ref().map(|(_, pose)| *pose);
+        // 画像時刻のカメラの角速度・速度（カメラ座標）。色付けのブレ量の予測に使う。
+        let camera_motion = match (image_state_and_pose.as_ref(), selected_image) {
+            (Some((image_state, _)), Some(metadata)) => camera_motion_at(
+                &imu_data,
+                &filter.imu_model,
+                image_state,
+                &filter.imu_origin_in_lidar,
+                &camera_from_lidar,
+                metadata.timestamp_sec,
+                CAMERA_MOTION_HALF_WINDOW_S,
+            ),
+            _ => None,
+        };
 
         let camera_from_world_at_image: Option<Matrix4<f64>> = lidar_pose_at_image_time
             .as_ref()
@@ -1372,11 +1399,19 @@ fn main() -> Result<()> {
         // それ以外は pickup_valid_source_points で平面に乗っている点だけ抽出し、
         // ICP 収束後の最終姿勢 (r_mat, t_vec) でワールドマップに追加する。
         let global_filter_start = Instant::now();
-        let global_source_points: Vec<Point3<f32>> = if !map_update_allowed {
+        // 点と、その点の面の法線（ワールド座標。LocalMap の近傍平面）。法線は色付けの
+        // 角度の項に使う。初回フレームは平面対応がないので法線なし。
+        let (global_source_points, global_source_normals): (
+            Vec<Point3<f32>>,
+            Vec<Option<Vector3<f32>>>,
+        ) = if !map_update_allowed {
             log::warn!("Frame {i}: map update skipped because ICP quality is insufficient");
-            Vec::new()
+            (Vec::new(), Vec::new())
         } else if local_map_was_empty {
-            downsampled_source_points_for_global.clone()
+            (
+                downsampled_source_points_for_global.clone(),
+                vec![None; downsampled_source_points_for_global.len()],
+            )
         } else {
             let valid = pickup_valid_source_points::<GLOBAL_KNN_K>(
                 &source_voxel_map_for_global,
@@ -1396,16 +1431,35 @@ fn main() -> Result<()> {
                 valid.len(),
                 source_voxel_map_for_global.len(),
             );
-            valid.into_iter().map(|c| c.src_point).collect()
+            valid
+                .into_iter()
+                .map(|c| (c.src_point, Some(c.plane_normal)))
+                .unzip()
         };
         let global_filter_time = global_filter_start.elapsed();
 
+        // --- GlobalMap に付ける色の選択（ベストビュー方式） ---
+        // 画像が選べないフレーム（画像なし・姿勢なし・暗すぎ・白飛び・ブレすぎ）は
+        // LiDAR の位置合わせとマップ更新だけ行い、色は一切付けない。
         let coloring_global_rgb_start = Instant::now();
+        let mut coloring_log = ColoringLog::default();
         let global_source_rgb: Option<Vec<Option<ColorObservation>>> = match (
             map_update_allowed,
             selected_rgb_image.as_ref(),
             camera_from_world_at_image.as_ref(),
         ) {
+            (false, _, _) => {
+                coloring_log.status = "lidar_rejected".into();
+                None
+            }
+            (true, None, _) => {
+                coloring_log.status = "no_image".into();
+                None
+            }
+            (true, Some(_), None) => {
+                coloring_log.status = "no_image_pose".into();
+                None
+            }
             (true, Some(rgb_image), Some(camera_from_world)) => {
                 let intrinsics =
                     CameraIntrinsics::for_image_size(rgb_image.width(), rgb_image.height())?;
@@ -1414,39 +1468,23 @@ fn main() -> Result<()> {
                 let camera_from_lidar_start =
                     camera_from_world * current_frame_info.current_global_pose;
 
-                let colors: Vec<Option<ColorObservation>> = global_source_points
-                    .iter()
-                    .map(|point| {
-                        let camera_point =
-                            camera_from_lidar_start.transform_point(&point.cast::<f64>());
-
-                        let (u, v) = project_camera_point(&camera_point, &intrinsics)?;
-
-                        let rgb = rgb_image.get_pixel_checked(u, v)?.0;
-
-                        // カメラ座標の原点は、画像撮影時のカメラ位置。
-                        // この点の長さが、カメラから対象点までの距離になる。
-                        let distance_m = camera_point.coords.norm();
-
-                        if !distance_m.is_finite() || distance_m <= 0.0 {
-                            return None;
-                        }
-
-                        Some(ColorObservation { rgb, distance_m })
-                    })
-                    .collect();
-
-                let colored_count = colors.iter().filter(|color| color.is_some()).count();
-
-                log::debug!(
-                    "Frame {i}: GlobalMap input RGB: {} / {} points",
-                    colored_count,
-                    global_source_points.len(),
+                let selection = select_frame_colors(
+                    &color_selection_config,
+                    &FrameColorInput {
+                        image: rgb_image,
+                        camera: &intrinsics,
+                        camera_from_lidar_start: &camera_from_lidar_start,
+                        world_from_lidar_start: &current_frame_info.current_global_pose,
+                        points: &global_source_points,
+                        normals: &global_source_normals,
+                        motion: camera_motion.as_ref(),
+                        map: &slam_map.global_voxel_map.voxel_map,
+                        map_voxel_size: slam_map.global_voxel_map.config.index_voxel_size,
+                    },
                 );
-
-                Some(colors)
+                coloring_log = selection.report;
+                selection.observations
             }
-            _ => None,
         };
         let coloring_global_rgb_time = coloring_global_rgb_start.elapsed();
 
@@ -1473,6 +1511,24 @@ fn main() -> Result<()> {
             global_update_stats.held_pending,
             global_update_stats.pending_voxels,
             global_update_stats.rejected_non_finite,
+        );
+        coloring_log.color_updates = global_update_stats.color_updates;
+        log::info!(
+            "Frame {i}: coloring status={} exposure_ratio={} (samples={}) median_blur={} px \
+             |w|={} deg/s saturated={} | candidates={} observations={} \
+             (rejected: saturated={} oblique={} blurry={}) color_updates={}",
+            coloring_log.status,
+            format_optional(coloring_log.exposure_ratio, 3),
+            coloring_log.exposure_samples,
+            format_optional(coloring_log.median_blur_px, 2),
+            format_optional(coloring_log.angular_speed_deg_s, 1),
+            format_optional(coloring_log.saturated_ratio, 3),
+            coloring_log.candidates,
+            coloring_log.observations,
+            coloring_log.rejected_saturated,
+            coloring_log.rejected_oblique,
+            coloring_log.rejected_blurry,
+            coloring_log.color_updates,
         );
 
         let delayed_surface_start = Instant::now();
@@ -1622,11 +1678,13 @@ fn main() -> Result<()> {
             gyro_bias_std_radps: covariance_summary.gyro_bias_radps,
             accel_bias_std_mps2: covariance_summary.accel_bias_mps2,
             eskf_prior_cost,
+            coloring: coloring_log,
         });
     }
 
     log_timing_summary(&frame_logs);
     log_rmse_summary(&frame_logs, image_time_offset_sec);
+    log_coloring_summary(&frame_logs);
 
     // --- Save the global voxel maps before and after final plane classification ---
     let min_samples = slam_map.global_voxel_map.config.min_points_per_voxel as u64;
@@ -1977,6 +2035,52 @@ fn log_rmse_summary(frame_logs: &[FrameLog], image_time_offset_sec: f64) {
         median(&rotation),
         mean(&rotation),
     );
+}
+
+fn format_optional(value: Option<f64>, precision: usize) -> String {
+    value.map_or_else(|| "-".to_string(), |value| format!("{value:.precision$}"))
+}
+
+/// 色付けしたフレーム数と、色付けしなかった理由の内訳、露光比・ブレ量の分布を表示する。
+fn log_coloring_summary(frame_logs: &[FrameLog]) {
+    if frame_logs.is_empty() {
+        return;
+    }
+    let mut status_counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for log in frame_logs {
+        *status_counts
+            .entry(log.coloring.status.as_str())
+            .or_default() += 1;
+    }
+    let colored = status_counts.get("colored").copied().unwrap_or(0);
+    let status_text = status_counts
+        .iter()
+        .map(|(status, count)| format!("{status}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    log::info!(
+        "Coloring summary: colored {colored} / {} frames ({:.1}%) | {status_text}",
+        frame_logs.len(),
+        colored as f64 / frame_logs.len() as f64 * 100.0,
+    );
+    let collect = |get: fn(&ColoringLog) -> Option<f64>| -> Vec<f64> {
+        frame_logs
+            .iter()
+            .filter_map(|log| get(&log.coloring))
+            .filter(|value| value.is_finite())
+            .collect()
+    };
+    log::info!(
+        "  exposure ratio (all evaluated): {} | median blur [px]: {} | |w| [deg/s]: {}",
+        format_value_stats(&collect(|c| c.exposure_ratio), 3),
+        format_value_stats(&collect(|c| c.median_blur_px), 2),
+        format_value_stats(&collect(|c| c.angular_speed_deg_s), 1),
+    );
+    let updates: usize = frame_logs
+        .iter()
+        .map(|log| log.coloring.color_updates)
+        .sum();
+    log::info!("  GlobalMap color updates (total over frames): {updates}");
 }
 
 #[derive(Debug)]

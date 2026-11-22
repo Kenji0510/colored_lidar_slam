@@ -207,6 +207,55 @@ impl Default for VisualAlignmentLog {
     }
 }
 
+/// GlobalMap への色付け（ベストビュー方式）の診断。`color_selection` を参照。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ColoringLog {
+    /// "colored"（色付けした）、または色付けしなかった理由:
+    /// "lidar_rejected" / "no_image" / "no_image_pose" / "too_dark" / "too_saturated" /
+    /// "too_blurry" / "no_candidates" / "invalid_config" / "invalid_camera_pose" /
+    /// "invalid_image_dimensions"。
+    pub status: String,
+    /// 画像の中央 75% に写り、深度が範囲内だった点の数。
+    pub candidates: usize,
+    /// 点ごとの判定を通り、色の観測として渡した点の数。
+    pub observations: usize,
+    pub rejected_saturated: usize,
+    pub rejected_oblique: usize,
+    pub rejected_blurry: usize,
+    /// 露光比 g = このフレームの輝度 / 地図にある色の輝度（同じセルどうしの中央値）。
+    pub exposure_ratio: Option<f64>,
+    /// 露光比の推定に使えた点の数。
+    pub exposure_samples: usize,
+    /// 予測ブレ量の中央値 [px]（幅 960 相当に換算）。
+    pub median_blur_px: Option<f64>,
+    /// 白飛び画素の割合。
+    pub saturated_ratio: Option<f64>,
+    /// 画像時刻のカメラの角速度の大きさ [deg/s]。
+    pub angular_speed_deg_s: Option<f64>,
+    /// このフレームの観測で色が更新された GlobalMap のセル数。
+    pub color_updates: usize,
+}
+
+impl Default for ColoringLog {
+    fn default() -> Self {
+        Self {
+            status: "not_run".into(),
+            candidates: 0,
+            observations: 0,
+            rejected_saturated: 0,
+            rejected_oblique: 0,
+            rejected_blurry: 0,
+            exposure_ratio: None,
+            exposure_samples: 0,
+            median_blur_px: None,
+            saturated_ratio: None,
+            angular_speed_deg_s: None,
+            color_updates: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameLog {
     pub frame_index: usize,
@@ -270,6 +319,9 @@ pub struct FrameLog {
     /// （予測を信用しすぎ）。
     #[serde(default)]
     pub eskf_prior_cost: Option<f64>,
+    /// GlobalMap への色付けの診断（色付けしなかったフレームは理由を記録）。
+    #[serde(default)]
+    pub coloring: ColoringLog,
 }
 
 #[cfg(test)]
@@ -297,6 +349,7 @@ mod tests {
         assert_eq!(log.observable_rank, 0);
         assert!(!log.map_updated);
         assert_eq!(log.timing.processing_total_ms, 0.0);
+        assert_eq!(log.coloring.status, "not_run");
     }
 }
 

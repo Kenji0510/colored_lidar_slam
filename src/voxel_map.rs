@@ -110,6 +110,8 @@ pub struct WorldMapUpdateStats {
     pub rejected_non_finite: usize,
     /// この更新後に保持されている pending voxel 数。
     pub pending_voxels: usize,
+    /// このフレームの観測で色が更新されたセル数。
+    pub color_updates: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +152,9 @@ pub struct VoxelCell {
     pub rgb: Option<[u8; 3]>,
 
     pub color_observation_distance_m: Option<f64>,
+
+    /// `rgb` を取った観測のスコア（`color_selection` 参照。大きいほど良い）。
+    pub color_score: Option<f32>,
 
     // Welford法の共分散計算用の中間値
     pub m2: Matrix3<f32>,
@@ -419,11 +424,12 @@ impl LOCALMap {
             match decision {
                 WorldPointUpdateDecision::InsertProvisional(point) => {
                     accumulate_frame_voxel(&mut accepted_frame_voxels, point, voxel_size);
-                    if let Some(rgb) = observation {
-                        accepted_frame_colors
-                            .entry(voxel_key(&point, voxel_size))
-                            .or_insert(rgb);
-                    }
+                    accumulate_frame_color(
+                        &mut accepted_frame_colors,
+                        &point,
+                        voxel_size,
+                        observation,
+                    );
                     self.pending_voxel_map
                         .remove(&voxel_key(&point, voxel_size));
                     stats.inserted_provisional += 1;
@@ -433,12 +439,6 @@ impl LOCALMap {
                     insertion,
                 } => {
                     accumulate_frame_voxel(&mut accepted_frame_voxels, insertion, voxel_size);
-                    if let Some(rgb) = observation {
-                        accepted_frame_colors
-                            .entry(voxel_key(&insertion, voxel_size))
-                            .or_insert(rgb);
-                    }
-
                     accumulate_frame_color(
                         &mut accepted_frame_colors,
                         &insertion,
@@ -477,18 +477,19 @@ impl LOCALMap {
             }
         }
         let frame_entry = self.insert_frame_voxels(accepted_frame_voxels, origin);
-        // 座標を統合したボクセルへ、採用点の色を保存
+        // 座標を統合したボクセルへ、採用点の色を保存（スコアが既存より高いときだけ）
         let mut updated_color_voxels = 0usize;
 
         for (key, observation) in accepted_frame_colors {
             if let Some(cell) = self.voxel_map.get_mut(&key) {
-                if cell.update_color_if_closer(observation) {
+                if cell.update_color_if_better(observation) {
                     updated_color_voxels += 1;
                 }
             }
         }
 
         log::debug!("GlobalMap color updates: {} voxels", updated_color_voxels,);
+        stats.color_updates = updated_color_voxels;
         self.frame_index.push_back(frame_entry);
 
         self.pending_voxel_map.retain(|_, pending| {
@@ -1039,7 +1040,8 @@ impl LOCALMap {
     }
 }
 
-/// 同じボクセルに入る色候補から、最も近い観測を残す。
+/// 同じボクセルに入る同じフレームの色候補から、スコアが最も高い観測を残す
+/// （同点なら近い方）。
 fn accumulate_frame_color(
     frame_colors: &mut FxHashMap<VoxelKey, ColorObservation>,
     point: &Point3<f32>,
@@ -1050,11 +1052,7 @@ fn accumulate_frame_color(
         return;
     };
 
-    if !point.coords.iter().all(|value| value.is_finite()) {
-        return;
-    }
-
-    if !observation.distance_m.is_finite() || observation.distance_m <= 0.0 {
+    if !point.coords.iter().all(|value| value.is_finite()) || !observation.is_valid() {
         return;
     }
 
@@ -1063,7 +1061,10 @@ fn accumulate_frame_color(
     frame_colors
         .entry(key)
         .and_modify(|stored| {
-            if observation.distance_m < stored.distance_m {
+            let better = observation.score > stored.score
+                || (observation.score == stored.score
+                    && observation.distance_m < stored.distance_m);
+            if better {
                 *stored = observation;
             }
         })
@@ -1629,10 +1630,26 @@ fn accumulate_frame_voxel(
         .or_insert((point.coords, 1));
 }
 
+/// 1 回の観測で得た色。どの観測を残すかはスコアで決める（`color_selection` 参照）。
 #[derive(Debug, Clone, Copy)]
 pub struct ColorObservation {
     pub rgb: [u8; 3],
+    /// カメラから点までの距離 [m]（記録用・同点時の比較用）。
     pub distance_m: f64,
+    /// 観測の良さ（大きいほど良い、正の値）。
+    pub score: f32,
+    /// このフレームと比べるとき、セルに保存済みのスコアに掛ける倍率（0..=1）。
+    /// 地図の色がこのフレームより暗く写った観測だった場合に、既存の色を減点する。
+    pub existing_score_scale: f32,
+}
+
+impl ColorObservation {
+    fn is_valid(&self) -> bool {
+        self.distance_m.is_finite()
+            && self.distance_m > 0.0
+            && self.score.is_finite()
+            && self.score > 0.0
+    }
 }
 
 impl VoxelCell {
@@ -1645,6 +1662,8 @@ impl VoxelCell {
             rgb: None,
 
             color_observation_distance_m: None,
+
+            color_score: None,
 
             m2: Matrix3::zeros(),
             sample_count: 0,
@@ -1677,6 +1696,8 @@ impl VoxelCell {
 
             color_observation_distance_m: None,
 
+            color_score: None,
+
             mean: point,
             m2: Matrix3::zeros(),
             sample_count: 1,
@@ -1701,25 +1722,31 @@ impl VoxelCell {
     //     }
     // }
 
-    pub fn update_color_if_closer(&mut self, observation: ColorObservation) -> bool {
-        let new_distance_m = observation.distance_m;
-
-        if !new_distance_m.is_finite() || new_distance_m <= 0.0 {
+    /// 新しい観測のスコアが、保存済みのスコア × `existing_score_scale` より高ければ色を置き換える。
+    /// 平均はしない（セルの色は常に 1 回の観測の色そのもの）。
+    pub fn update_color_if_better(&mut self, observation: ColorObservation) -> bool {
+        if !observation.is_valid() {
             return false;
         }
+        let scale = if observation.existing_score_scale.is_finite() {
+            observation.existing_score_scale.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
 
         let should_update = self.rgb.is_none()
             || self
-                .color_observation_distance_m
-                .map_or(true, |stored_distance_m| new_distance_m < stored_distance_m);
+                .color_score
+                .is_none_or(|stored_score| observation.score > stored_score * scale);
 
         if !should_update {
             return false;
         }
 
-        // 色と、その色を取得した観測距離を必ず同時に更新する。
+        // 色と、その色を取得した観測のスコア・距離を必ず同時に更新する。
         self.rgb = Some(observation.rgb);
-        self.color_observation_distance_m = Some(new_distance_m);
+        self.color_score = Some(observation.score);
+        self.color_observation_distance_m = Some(observation.distance_m);
 
         true
     }
@@ -2292,5 +2319,102 @@ mod tests {
         assert_eq!(stats.inserted_provisional, 1);
         assert_eq!(stats.held_pending, 0);
         assert_eq!(map.voxel_map.len(), 1);
+    }
+
+    fn observation(value: u8, score: f32, existing_score_scale: f32) -> ColorObservation {
+        ColorObservation {
+            rgb: [value; 3],
+            distance_m: 2.0,
+            score,
+            existing_score_scale,
+        }
+    }
+
+    #[test]
+    fn cell_color_keeps_the_best_scoring_observation_without_averaging() {
+        let key = VoxelKey {
+            ix: 0,
+            iy: 0,
+            iz: 0,
+        };
+        let mut cell = VoxelCell::from_key(&key, 0.05, Point3::origin(), 0);
+        assert!(cell.update_color_if_better(observation(100, 0.5, 1.0)));
+        assert!(!cell.update_color_if_better(observation(200, 0.4, 1.0)));
+        assert_eq!(cell.rgb, Some([100; 3]));
+        // 平均ではなく置き換え
+        assert!(cell.update_color_if_better(observation(150, 0.6, 1.0)));
+        assert_eq!(cell.rgb, Some([150; 3]));
+        assert_eq!(cell.color_score, Some(0.6));
+        // 既存の色が暗く写った観測だった（倍率 0.25）なら、スコアが低くても置き換わる
+        assert!(cell.update_color_if_better(observation(220, 0.2, 0.25)));
+        assert_eq!(cell.rgb, Some([220; 3]));
+        assert_eq!(cell.color_score, Some(0.2));
+        // 無効なスコアの観測は使わない
+        assert!(!cell.update_color_if_better(observation(10, f32::NAN, 1.0)));
+        assert!(!cell.update_color_if_better(observation(10, 0.0, 1.0)));
+        assert_eq!(cell.rgb, Some([220; 3]));
+    }
+
+    #[test]
+    fn best_scoring_point_of_a_frame_colors_the_voxel_on_both_insert_paths() {
+        let identity = Matrix4::<f64>::identity();
+        let origin_key = VoxelKey {
+            ix: 0,
+            iy: 0,
+            iz: 0,
+        };
+
+        // 近くに成熟平面がない（provisional）経路
+        let mut map = LOCALMap::new(map_config());
+        let points = [
+            Point3::new(0.01, 0.01, 0.01),
+            Point3::new(0.02, 0.02, 0.02),
+            Point3::new(0.03, 0.01, 0.02),
+        ];
+        let colors = [
+            Some(observation(50, 0.3, 1.0)),
+            Some(observation(90, 0.9, 1.0)),
+            Some(observation(70, 0.5, 1.0)),
+        ];
+        let stats = map.update_world_map_filtered_with_rgb(
+            &points,
+            Some(&colors),
+            &identity,
+            &world_update_filter_config(),
+        );
+        assert_eq!(stats.inserted_provisional, 3);
+        assert_eq!(stats.color_updates, 1);
+        assert_eq!(map.voxel_map[&origin_key].rgb, Some([90; 3]));
+
+        // 成熟平面へ射影する経路
+        let mut map = LOCALMap::new(map_config());
+        insert_mature_yz_plane_cell(&mut map);
+        let points = [
+            Point3::new(0.015, 0.01, 0.01),
+            Point3::new(0.005, 0.02, 0.02),
+        ];
+        let colors = [
+            Some(observation(60, 0.2, 1.0)),
+            Some(observation(180, 0.7, 1.0)),
+        ];
+        let stats = map.update_world_map_filtered_with_rgb(
+            &points,
+            Some(&colors),
+            &identity,
+            &world_update_filter_config(),
+        );
+        assert_eq!(stats.projected_to_mature_plane, 2);
+        assert_eq!(stats.color_updates, 1);
+        assert_eq!(map.voxel_map[&origin_key].rgb, Some([180; 3]));
+
+        // 次のフレームの観測の方がスコアが低ければ、色は変わらない
+        let stats = map.update_world_map_filtered_with_rgb(
+            &[Point3::new(0.01, 0.01, 0.01)],
+            Some(&[Some(observation(10, 0.5, 1.0))]),
+            &identity,
+            &world_update_filter_config(),
+        );
+        assert_eq!(stats.color_updates, 0);
+        assert_eq!(map.voxel_map[&origin_key].rgb, Some([180; 3]));
     }
 }
