@@ -42,7 +42,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/11222026/01";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/11222026/04";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
 const SAVE_ROOT_DIR: &str = "data/output/11222026";
 
@@ -594,9 +594,9 @@ fn main() -> Result<()> {
 
     let camera_from_lidar = build_camera_from_lidar(
         Vector3::new(0.01, 0.2, 0.035), // カメラ位置 [m]
-        -1.0,                           // roll [deg]
-        0.7,                            // pitch [deg]
-        -1.0,                            // yaw [deg]
+        -1.0,                           // roll [deg]（未確定）
+        -0.18,                          // pitch [deg]
+        -0.28,                          // yaw [deg]
     );
     // GlobalMap の各セルは、スコア（距離 × 角度 × 露光 × 鮮鋭さ）が最も高い 1 回の観測の色を持つ。
     // 暗すぎる・ブレすぎる・白飛びの多い画像のフレームでは色を付けない。
