@@ -595,7 +595,7 @@ fn main() -> Result<()> {
     let camera_from_lidar = build_camera_from_lidar(
         Vector3::new(0.01, 0.2, 0.035), // カメラ位置 [m]
         -1.0,                           // roll [deg]
-        -0.5,                            // pitch [deg]
+        0.7,                            // pitch [deg]
         -1.0,                            // yaw [deg]
     );
     // GlobalMap の各セルは、スコア（距離 × 角度 × 露光 × 鮮鋭さ）が最も高い 1 回の観測の色を持つ。
