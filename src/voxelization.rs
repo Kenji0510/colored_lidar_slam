@@ -1,5 +1,7 @@
+use crate::types::{ColoredPoint, PointXYZRGB};
 use crate::voxel_map::{VoxelCell, VoxelMap, voxel_key};
 use nalgebra::{Point3, Vector3};
+use std::collections::HashMap;
 use nohash_hasher::IntMap;
 use rayon::prelude::*;
 
@@ -327,12 +329,109 @@ fn stat_map_into_point_cloud(
     DownsampledPointCloud { points, voxel_map }
 }
 
+/// 色付き点群をボクセル化する。色を持つ点だけを使い、各ボクセルで位置と RGB を平均する。
+///
+/// 色のない点（画像に写らなかった点）と XYZ が非有限の点は捨てる。出力はボクセル
+/// インデックス順に並べるので、同じ入力からは毎回同じ順序の点群が得られる。
+pub fn voxel_downsample_colored_points(
+    points: &[ColoredPoint],
+    voxel_size: f32,
+) -> Vec<PointXYZRGB> {
+    assert!(voxel_size > 0.0, "voxel_size must be positive");
+    let inv_voxel = 1.0 / voxel_size;
+
+    #[derive(Default)]
+    struct ColorStat {
+        position_sum: Vector3<f64>,
+        rgb_sum: [u64; 3],
+        count: u64,
+    }
+
+    let mut voxels: HashMap<(i64, i64, i64), ColorStat> = HashMap::new();
+    for point in points {
+        let Some(rgb) = point.rgb else { continue };
+        if !point.position.coords.iter().all(|value| value.is_finite()) {
+            continue;
+        }
+        let key = (
+            (point.position.x * inv_voxel).floor() as i64,
+            (point.position.y * inv_voxel).floor() as i64,
+            (point.position.z * inv_voxel).floor() as i64,
+        );
+        let stat = voxels.entry(key).or_default();
+        stat.position_sum += point.position.coords.cast::<f64>();
+        for (sum, value) in stat.rgb_sum.iter_mut().zip(rgb) {
+            *sum += u64::from(value);
+        }
+        stat.count += 1;
+    }
+
+    let mut voxels: Vec<_> = voxels.into_iter().collect();
+    voxels.sort_unstable_by_key(|(key, _)| *key);
+    voxels
+        .into_iter()
+        .map(|(_, stat)| {
+            let count = stat.count as f64;
+            let mean = (stat.position_sum / count).cast::<f32>();
+            let rgb = stat
+                .rgb_sum
+                .map(|sum| ((sum as f64 / count).round()).clamp(0.0, 255.0) as u8);
+            PointXYZRGB::new(Point3::from(mean), rgb)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        voxel_downsample_points, voxel_downsample_points_and_maps_dual,
-        voxel_downsample_points_dual,
+        voxel_downsample_colored_points, voxel_downsample_points,
+        voxel_downsample_points_and_maps_dual, voxel_downsample_points_dual,
     };
+    use crate::types::ColoredPoint;
+    use nalgebra::Point3 as P3;
+
+    #[test]
+    fn colored_downsample_averages_color_and_drops_uncolored_points() {
+        let points = vec![
+            ColoredPoint {
+                position: P3::new(0.01, 0.01, 0.01),
+                rgb: Some([10, 20, 30]),
+            },
+            ColoredPoint {
+                position: P3::new(0.03, 0.03, 0.03),
+                rgb: Some([20, 40, 61]),
+            },
+            ColoredPoint {
+                position: P3::new(0.02, 0.02, 0.02),
+                rgb: None,
+            },
+            ColoredPoint {
+                position: P3::new(1.0, 1.0, 1.0),
+                rgb: None,
+            },
+            ColoredPoint {
+                position: P3::new(f32::NAN, 0.0, 0.0),
+                rgb: Some([1, 1, 1]),
+            },
+        ];
+
+        let voxels = voxel_downsample_colored_points(&points, 0.1);
+        assert_eq!(voxels.len(), 1);
+        let voxel = &voxels[0];
+        assert!((voxel.x - 0.02).abs() < 1e-6);
+        assert!((voxel.y - 0.02).abs() < 1e-6);
+        assert!((voxel.z - 0.02).abs() < 1e-6);
+        let packed = voxel.rgb.to_bits();
+        assert_eq!(
+            [(packed >> 16) as u8, (packed >> 8) as u8, packed as u8],
+            [15, 30, 46]
+        );
+    }
+
+    #[test]
+    fn colored_downsample_handles_empty_input() {
+        assert!(voxel_downsample_colored_points(&[], 0.05).is_empty());
+    }
     use crate::voxel_map::build_voxel_map;
     use nalgebra::Point3;
 

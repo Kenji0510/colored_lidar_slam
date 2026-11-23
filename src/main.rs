@@ -23,24 +23,28 @@ use re_lidar_slam::{
     },
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory},
     types::{
-        ColoringLog, CurrentFrameInfo, FrameLog, FrameTiming, IMU, ImageFrameMetadata, PointXYZ,
-        PointXYZRGB, SLAMMap, VisualAlignmentLog,
+        ColoringLog, CurrentFrameInfo, FrameLog, FrameRegistrationResult, FrameTiming, IMU,
+        ImageFrameMetadata, ImageRegistrationResult, LidarRegistrationResult, PointXYZ,
+        PointXYZRGB, RegistrationPose, SLAMMap, VisualAlignmentLog,
     },
     visual_alignment::{VisualAligner, VisualAlignmentConfig, VisualFrame},
     voxel_map::{
         ColorObservation, LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus,
         WorldMapUpdateFilterConfig,
     },
-    voxelization::{voxel_downsample_points, voxel_downsample_points_and_maps_dual},
+    voxelization::{
+        voxel_downsample_colored_points, voxel_downsample_points,
+        voxel_downsample_points_and_maps_dual,
+    },
 };
 use std::{
     ffi::OsString,
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/11142026/02";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/11222026/01";
 // const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
-const SAVE_ROOT_DIR: &str = "data/output/11142026";
+const SAVE_ROOT_DIR: &str = "data/output/11222026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LidarModel {
@@ -252,6 +256,10 @@ const IMU_TO_AVIA_TRANSLATION_Z_M: f64 = 0.02840;
 const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.25; // m
 const LOCAL_MAP_VOXEL_SIZE: f32 = 0.25; // m
 const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.025; // m
+/// フレームごとに保存する色付き点群のボクセルサイズ（GlobalMap と同じ解像度）。
+const FRAME_COLORED_CLOUD_VOXEL_SIZE: f32 = GLOBAL_MAP_VOXEL_SIZE; // m
+/// フレームごとの色付き点群の保存先（save_dir からの相対パス）。
+const FRAME_COLORED_CLOUD_SUBDIR: &str = "frames";
 // このセンサー構成では、走行全体で 1 フレームあたり約 1800 個の GlobalMap
 // voxel が増える。入力フレーム数から最終容量を先に確保し、実行途中の巨大な
 // HashMap 再配置（数百 ms のスパイク）を避ける。
@@ -578,6 +586,10 @@ fn main() -> Result<()> {
 
     let mut prev_frame_start_time: f64 = 0.0;
     let mut frame_logs: Vec<FrameLog> = Vec::new();
+    // 各フレームの位置合わせ結果（LiDAR / 画像の姿勢と RMSE）。最後に JSON で保存する。
+    let mut registration_results: Vec<FrameRegistrationResult> = Vec::with_capacity(pcd_files.len());
+    let frame_cloud_dir = format!("{save_dir}/{FRAME_COLORED_CLOUD_SUBDIR}");
+    std::fs::create_dir_all(&frame_cloud_dir)?;
     let mut visual_aligner = VisualAligner::new(VisualAlignmentConfig::default());
 
     let camera_from_lidar = build_camera_from_lidar(
@@ -1150,6 +1162,15 @@ fn main() -> Result<()> {
             (0.0, 0.0)
         };
         let map_update_allowed = local_map_was_empty || icp_ok;
+        // LiDAR 点群による位置合わせの結果姿勢（画像位置合わせで補正される前）。
+        let lidar_registered_pose = filter.lidar_pose();
+        let lidar_registration_status = if local_map_was_empty || lidar_update.is_none() {
+            "skipped"
+        } else if icp_ok {
+            "ok"
+        } else {
+            "rejected"
+        };
 
         // --- Direct image alignment: keyframe 9x9 patches -> current image ---
         // キーフレーム K のパッチ（GlobalMap の Planar 点＋法線付き平面）を今の画像へ投影し、
@@ -1648,6 +1669,55 @@ fn main() -> Result<()> {
             timing.icp_other_ms,
             timing.icp_ms,
         );
+        // --- Save the voxelized colored frame cloud (same file name as the input PCD) ---
+        // 点はこのフレームの最終姿勢で変換したワールド座標。色のない点は含めない。
+        let pcd_file_name = pcd_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("cloud_{i}.pcd"));
+        let frame_colored_cloud =
+            voxel_downsample_colored_points(&colored_world_points, FRAME_COLORED_CLOUD_VOXEL_SIZE);
+        let colored_cloud_file = if frame_colored_cloud.is_empty() {
+            log::info!("Frame {i}: colored frame cloud not saved (no colored points)");
+            None
+        } else {
+            let relative_path = format!("{FRAME_COLORED_CLOUD_SUBDIR}/{pcd_file_name}");
+            let path = format!("{save_dir}/{relative_path}");
+            save_pcd_xyzrgb(&frame_colored_cloud, &path)?;
+            log::debug!(
+                "Frame {i}: saved colored frame cloud {} → {} voxels → {}",
+                colored_count,
+                frame_colored_cloud.len(),
+                path,
+            );
+            Some(relative_path)
+        };
+
+        registration_results.push(FrameRegistrationResult {
+            frame_index: i,
+            pcd_file_name,
+            timestamp: current_frame_start_time,
+            lidar: LidarRegistrationResult {
+                status: lidar_registration_status.into(),
+                rmse_m: final_rmse.filter(|rmse| rmse.is_finite()),
+                correspondence_count: final_correspondence_count,
+                pose: RegistrationPose::from_matrix(&lidar_registered_pose),
+            },
+            image: ImageRegistrationResult {
+                status: visual_alignment_log.status.clone(),
+                update_applied: visual_alignment_log.update_applied,
+                initial_rmse: visual_alignment_log.initial_rmse,
+                final_rmse: visual_alignment_log.final_rmse,
+                matched_patches: visual_alignment_log.matched_patches,
+                image_file_name: selected_image.map(|metadata| metadata.file_name.clone()),
+                image_timestamp_sec: selected_image.map(|metadata| metadata.timestamp_sec),
+                pose: RegistrationPose::from_matrix(&new_global_pose),
+            },
+            colored_cloud_file,
+            colored_cloud_points: frame_colored_cloud.len(),
+        });
+        // --- Save the voxelized colored frame cloud (same file name as the input PCD) ---
+
         frame_logs.push(FrameLog {
             frame_index: i,
             timestamp: current_frame_start_time,
@@ -1853,6 +1923,18 @@ fn main() -> Result<()> {
         frame_logs_path
     );
     // --- Save per-frame ICP logs to JSON ---
+
+    // --- Save per-frame registration results (LiDAR / image pose and RMSE) to JSON ---
+    let registration_results_path = format!("{}/registration_results.json", save_dir);
+    let registration_results_json = serde_json::to_string_pretty(&registration_results)?;
+    std::fs::write(&registration_results_path, &registration_results_json)?;
+    log::info!(
+        "Saved registration results: {} frames → {} (colored frame clouds → {})",
+        registration_results.len(),
+        registration_results_path,
+        frame_cloud_dir,
+    );
+    // --- Save per-frame registration results (LiDAR / image pose and RMSE) to JSON ---
 
     Ok(())
 }

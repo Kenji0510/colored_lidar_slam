@@ -407,3 +407,78 @@ impl PointXYZRGB {
         }
     }
 }
+
+/// 位置合わせで得た姿勢（ワールド座標系における LiDAR フレーム開始時刻の LiDAR 姿勢）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistrationPose {
+    /// 位置 [m] (x, y, z)。
+    pub position_m: [f64; 3],
+    /// 姿勢の四元数 (x, y, z, w)。
+    pub orientation_xyzw: [f64; 4],
+    /// 同次変換行列 world_from_lidar（行優先の 4x4）。
+    pub world_from_lidar: [[f64; 4]; 4],
+}
+
+impl RegistrationPose {
+    pub fn from_matrix(pose: &Matrix4<f64>) -> Self {
+        let rotation: nalgebra::Matrix3<f64> = pose.fixed_view::<3, 3>(0, 0).into_owned();
+        let quaternion = nalgebra::UnitQuaternion::from_matrix(&rotation);
+        let mut world_from_lidar = [[0.0; 4]; 4];
+        for (row, values) in world_from_lidar.iter_mut().enumerate() {
+            for (col, value) in values.iter_mut().enumerate() {
+                *value = pose[(row, col)];
+            }
+        }
+        Self {
+            position_m: [pose[(0, 3)], pose[(1, 3)], pose[(2, 3)]],
+            orientation_xyzw: [quaternion.i, quaternion.j, quaternion.k, quaternion.w],
+            world_from_lidar,
+        }
+    }
+}
+
+/// LiDAR 点群による位置合わせ (Point-to-Plane ICP) の結果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LidarRegistrationResult {
+    /// "ok"（採用）/ "rejected"（品質不足で IMU 予測を使用）/ "skipped"（初回フレーム等で未実行）。
+    pub status: String,
+    /// 最終 Point-to-Plane RMSE [m]。ICP が候補を出さなかった場合は None。
+    pub rmse_m: Option<f32>,
+    pub correspondence_count: usize,
+    /// ICP 後（画像位置合わせ前）の姿勢。rejected / skipped の場合は IMU 予測姿勢。
+    pub pose: RegistrationPose,
+}
+
+/// 画像による位置合わせ（キーフレームパッチの直接法）の結果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageRegistrationResult {
+    /// `VisualAlignmentLog::status` と同じ。
+    pub status: String,
+    /// 補正を状態へ反映したか。false の場合 `pose` は LiDAR 位置合わせの姿勢と同じ。
+    pub update_applied: bool,
+    /// パッチ平均除去後の輝度 RMSE（0..255）。補正前 / 補正後。
+    pub initial_rmse: Option<f64>,
+    pub final_rmse: Option<f64>,
+    pub matched_patches: usize,
+    /// 使用した画像ファイル名（画像が選べなかった場合は None）。
+    pub image_file_name: Option<String>,
+    /// 画像タイムスタンプ（時刻オフセット適用後）[s]。
+    pub image_timestamp_sec: Option<f64>,
+    /// 画像位置合わせ後の姿勢（このフレームの最終姿勢）。
+    pub pose: RegistrationPose,
+}
+
+/// 1 フレーム分の位置合わせ結果。`registration_results.json` に配列で保存する。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameRegistrationResult {
+    pub frame_index: usize,
+    /// 入力 PCD のファイル名（例: cloud_000123.pcd）。
+    pub pcd_file_name: String,
+    /// LiDAR フレーム開始時刻 [s]。姿勢はこの時刻のもの。
+    pub timestamp: f64,
+    pub lidar: LidarRegistrationResult,
+    pub image: ImageRegistrationResult,
+    /// 保存したボクセル化済み色付き点群の相対パス（色付き点が無く保存しなかった場合は None）。
+    pub colored_cloud_file: Option<String>,
+    pub colored_cloud_points: usize,
+}
