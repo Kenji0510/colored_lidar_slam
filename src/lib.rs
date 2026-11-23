@@ -1,4 +1,5 @@
 pub mod convert_imu_data;
+pub mod dense_color_map;
 pub mod deskew_points;
 pub mod eskf;
 pub mod file_handler;

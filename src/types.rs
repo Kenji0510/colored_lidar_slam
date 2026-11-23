@@ -235,6 +235,12 @@ pub struct ColoringLog {
     pub angular_speed_deg_s: Option<f64>,
     /// このフレームの観測で色が更新された GlobalMap のセル数。
     pub color_updates: usize,
+    /// 最終の色付き点群（dense、`dense_color_map` 参照）に貯めた点の数。
+    pub dense_points_stored: usize,
+    /// 最初の訪問が終わって固定済みのセルだったので、貯めなかった点の数。
+    pub dense_points_dropped_locked: usize,
+    /// より近くから見たので点を入れ替えたセルの数。
+    pub dense_cells_replaced: usize,
 }
 
 impl Default for ColoringLog {
@@ -252,6 +258,9 @@ impl Default for ColoringLog {
             saturated_ratio: None,
             angular_speed_deg_s: None,
             color_updates: 0,
+            dense_points_stored: 0,
+            dense_points_dropped_locked: 0,
+            dense_cells_replaced: 0,
         }
     }
 }
