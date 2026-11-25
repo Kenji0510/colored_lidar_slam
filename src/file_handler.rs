@@ -5,7 +5,7 @@ use pcd_rs::Reader;
 
 use crate::types::{
     ImageFrameMetadata, ImageRecordingMetadata, LoadIMU, PointXYZ, PointXYZCov, PointXYZIT,
-    PointXYZNormal, PointXYZRGB,
+    PointXYZNormal, PointXYZRGB, PointXYZRGBFrame,
 };
 
 pub fn load_pcd_files(dir_path: &str) -> Result<Vec<PathBuf>> {
@@ -191,6 +191,25 @@ pub fn load_rgb_image(path: &std::path::Path) -> Result<image::RgbImage> {
 }
 
 pub fn save_pcd_xyzrgb(points: &[PointXYZRGB], file_path: &str) -> Result<()> {
+    let mut writer = pcd_rs::WriterInit {
+        width: points.len() as u64,
+        height: 1,
+        viewpoint: Default::default(),
+        data_kind: pcd_rs::DataKind::Binary,
+        schema: None,
+    }
+    .create(file_path)?;
+
+    for point in points {
+        writer.push(point)?;
+    }
+
+    writer.finish()?;
+    Ok(())
+}
+
+/// 色付き点とフレーム番号を保存する（確認用）。
+pub fn save_pcd_xyzrgb_frame(points: &[PointXYZRGBFrame], file_path: &str) -> Result<()> {
     let mut writer = pcd_rs::WriterInit {
         width: points.len() as u64,
         height: 1,

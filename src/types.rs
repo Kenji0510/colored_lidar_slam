@@ -235,12 +235,8 @@ pub struct ColoringLog {
     pub angular_speed_deg_s: Option<f64>,
     /// このフレームの観測で色が更新された GlobalMap のセル数。
     pub color_updates: usize,
-    /// 最終の色付き点群（dense、`dense_color_map` 参照）に貯めた点の数。
+    /// 最終の色付き点群（dense、`dense_color_map` 参照）の候補として貯めた点の数。
     pub dense_points_stored: usize,
-    /// 最初の訪問が終わって固定済みのセルだったので、貯めなかった点の数。
-    pub dense_points_dropped_locked: usize,
-    /// より近くから見たので点を入れ替えたセルの数。
-    pub dense_cells_replaced: usize,
 }
 
 impl Default for ColoringLog {
@@ -259,8 +255,6 @@ impl Default for ColoringLog {
             angular_speed_deg_s: None,
             color_updates: 0,
             dense_points_stored: 0,
-            dense_points_dropped_locked: 0,
-            dense_cells_replaced: 0,
         }
     }
 }
@@ -402,6 +396,16 @@ pub struct PointXYZRGB {
     pub y: f32,
     pub z: f32,
     pub rgb: f32,
+}
+
+/// 色付き点と、その点を撮ったフレーム番号（確認用の出力。ビューアでフレーム番号ごとに色分けできる）。
+#[derive(Debug, Clone, PcdDeserialize, PcdSerialize)]
+pub struct PointXYZRGBFrame {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub rgb: f32,
+    pub frame: f32,
 }
 
 impl PointXYZRGB {

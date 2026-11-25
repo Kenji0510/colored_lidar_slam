@@ -7,7 +7,7 @@ use re_lidar_slam::{
     color_selection::{
         ColorSelectionConfig, FrameColorInput, camera_motion_at, select_frame_colors,
     },
-    dense_color_map::{DenseColorFrameStats, DenseColorMap, DenseColorMapConfig},
+    dense_color_map::{DenseColorMap, DenseColorMapConfig},
     deskew_points::deskew_points,
     eskf::{
         Eskf, EskfConfig, ImuModel, ImuNoise, InitialStd, NavState, STANDARD_GRAVITY_MPS2,
@@ -15,7 +15,7 @@ use re_lidar_slam::{
     },
     file_handler::{
         find_nearest_image_frame, load_image_meta, load_imu_data, load_pcd_files, load_pcd_xyzit,
-        load_rgb_image, save_pcd_xyz, save_pcd_xyzrgb,
+        load_rgb_image, save_pcd_xyz, save_pcd_xyzrgb, save_pcd_xyzrgb_frame,
     },
     find_nearest_points::pickup_valid_source_points,
     icp::{
@@ -341,16 +341,17 @@ const MAX_DIST_FOR_VOXEL_MAP: f32 = 150.0;
 const CAMERA_MOTION_HALF_WINDOW_S: f64 = 0.005;
 
 // --- 最終の色付き点群（リアルタイム表示と同じ細かさ、dense_color_map.rs） ---
-// フレームごとの色付き点群（frames/cloud_N.pcd と同じ点）を、1 セルに何点でもそのまま貯める。
-// セルに初めて点が入ってからこのフレーム数のあいだ（最初の訪問）の点だけを残し、以後は固定する。
-const DENSE_COLOR_VISIT_WINDOW_FRAMES: u64 = 10;
-const DENSE_COLOR_MAX_POINTS_PER_CELL: u16 = 10;
-// 最初の訪問でこの点数に満たないセルは固定せず、後のフレームで埋める。
-const DENSE_COLOR_MIN_POINTS_TO_LOCK: u16 = 4;
-// 最初の訪問よりこの倍率以上近くから見たときだけ、セルの点を入れ替える（f32::INFINITY で無効）。
-const DENSE_COLOR_CLOSER_OVERRIDE_RATIO: f32 = 2.0;
+// フレームごとの色付き点群（frames/cloud_N.pcd と同じ点）を貯めておき、最後に区画ごとに
+// 連続したフレームの窓（1 回の訪問）を 1 つ選んで、その点だけを出力する（周回を混ぜない）。
+// 選ぶのは、その区画に入る点が最も多い（＝最も細かく写った）訪問。
+const DENSE_COLOR_TILE_SIZE_M: f32 = 0.5;
+const DENSE_COLOR_VISIT_WINDOW_FRAMES: u32 = 20;
+// 一番良い訪問で点のなかったセルだけ、2 番目以降の訪問で埋める（1 なら埋めない）。
+const DENSE_COLOR_MAX_VISITS_PER_TILE: usize = 3;
 // ブレすぎと判定されたフレーム（color_selection の too_blurry）の点は貯めない。
 const DENSE_COLOR_SKIP_BLURRY_FRAMES: bool = true;
+// 点ごとのフレーム番号を入れた確認用のファイルも保存する。
+const DENSE_COLOR_SAVE_FRAME_INDEX: bool = true;
 
 // --- ESKF ---
 // IMU ノイズ密度。データシート値（例: BMI088 はジャイロ約 2.4e-4 rad/s/√Hz、
@@ -608,20 +609,19 @@ fn main() -> Result<()> {
     let camera_from_lidar = build_camera_from_lidar(
         Vector3::new(0.01, 0.2, 0.035), // カメラ位置 [m]
         -1.0,                           // roll [deg]（未確定）
-        -0.18,                          // pitch [deg]
+        -0.95,                          // pitch [deg] 0.18
         -0.28,                          // yaw [deg]
     );
     // GlobalMap の各セルは、スコア（距離 × 角度 × 露光 × 鮮鋭さ）が最も高い 1 回の観測の色を持つ。
     // 暗すぎる・ブレすぎる・白飛びの多い画像のフレームでは色を付けない。
     let color_selection_config = ColorSelectionConfig::default();
     log::info!("Color selection config: {color_selection_config:?}");
-    // 最終の色付き点群（最初の訪問の点を固定して貯める）。
+    // 最終の色付き点群（区画ごとに 1 回の訪問の点だけを使う）。
     let mut dense_color_map = DenseColorMap::new(DenseColorMapConfig {
-        voxel_size: GLOBAL_MAP_VOXEL_SIZE,
+        cell_size: FRAME_COLORED_CLOUD_VOXEL_SIZE,
+        tile_size: DENSE_COLOR_TILE_SIZE_M,
         visit_window_frames: DENSE_COLOR_VISIT_WINDOW_FRAMES,
-        max_points_per_cell: DENSE_COLOR_MAX_POINTS_PER_CELL,
-        min_points_to_lock: DENSE_COLOR_MIN_POINTS_TO_LOCK,
-        closer_override_ratio: DENSE_COLOR_CLOSER_OVERRIDE_RATIO,
+        max_visits_per_tile: DENSE_COLOR_MAX_VISITS_PER_TILE,
     });
     log::info!(
         "Dense color map config: {:?}, skip_blurry_frames={}",
@@ -1719,7 +1719,7 @@ fn main() -> Result<()> {
             Some(relative_path)
         };
 
-        // --- 最終の色付き点群へ追加（最初の訪問の点だけを残す） ---
+        // --- 最終の色付き点群の候補として貯める（使う点は最後に区画ごとに選ぶ） ---
         // LiDAR の位置合わせが採用され、画像の質の判定（暗すぎ・白飛び・ブレすぎ）を通った
         // フレームだけを使う。白飛びした画素の点は入れない。
         let dense_frame_ok = map_update_allowed
@@ -1728,13 +1728,8 @@ fn main() -> Result<()> {
                 "too_blurry" => !DENSE_COLOR_SKIP_BLURRY_FRAMES,
                 _ => false,
             };
-        let dense_stats = match (dense_frame_ok, camera_from_world_at_image.as_ref()) {
-            (true, Some(camera_from_world)) => {
-                let rotation = camera_from_world.fixed_view::<3, 3>(0, 0);
-                let translation = camera_from_world.fixed_view::<3, 1>(0, 3);
-                let center = -(rotation.transpose() * translation);
-                let camera_center =
-                    Point3::new(center.x as f32, center.y as f32, center.z as f32);
+        let dense_points_stored = match (dense_frame_ok, camera_from_world_at_image.as_ref()) {
+            (true, Some(_)) => {
                 let unsaturated: Vec<ColoredPoint> = colored_world_points
                     .iter()
                     .filter(|point| {
@@ -1747,14 +1742,14 @@ fn main() -> Result<()> {
                     .collect();
                 let points =
                     voxel_downsample_colored_points(&unsaturated, FRAME_COLORED_CLOUD_VOXEL_SIZE);
-                dense_color_map.insert_frame(i as u64, &camera_center, &points)
+                dense_color_map.insert_frame(i as u64, &points)
             }
-            _ => DenseColorFrameStats::default(),
+            _ => 0,
         };
-        coloring_log.dense_points_stored = dense_stats.stored_points;
-        coloring_log.dense_points_dropped_locked = dense_stats.dropped_locked_points;
-        coloring_log.dense_cells_replaced = dense_stats.replaced_cells;
-        log::debug!("Frame {i}: dense color map ok={dense_frame_ok} {dense_stats:?}");
+        coloring_log.dense_points_stored = dense_points_stored;
+        log::debug!(
+            "Frame {i}: dense color map ok={dense_frame_ok} stored={dense_points_stored}"
+        );
 
         registration_results.push(FrameRegistrationResult {
             frame_index: i,
@@ -1941,26 +1936,50 @@ fn main() -> Result<()> {
         );
     }
 
-    // 最終の色付き点群（リアルタイム表示と同じ細かさ。各セルは最初の訪問の点だけ）。
-    let dense_world_map_rgb = dense_color_map.colored_points();
-    let dense_summary = dense_color_map.summary();
+    // 最終の色付き点群（リアルタイム表示と同じ細かさ。区画ごとに 1 回の訪問の点だけ）。
+    let dense_build_start = Instant::now();
+    let dense_result = dense_color_map.build();
+    let dense_summary = dense_result.summary;
     let dense_world_map_rgb_path = format!(
         "{}/voxel-{}_world_map_rgb_dense.pcd",
         save_dir, GLOBAL_MAP_VOXEL_SIZE,
     );
-    if dense_world_map_rgb.is_empty() {
+    if dense_result.points.is_empty() {
         log::info!("Dense RGB export skipped: no colored points");
     } else {
+        let dense_world_map_rgb: Vec<PointXYZRGB> = dense_result
+            .points
+            .iter()
+            .map(|point| PointXYZRGB {
+                x: point.x,
+                y: point.y,
+                z: point.z,
+                rgb: point.rgb,
+            })
+            .collect();
         save_pcd_xyzrgb(&dense_world_map_rgb, &dense_world_map_rgb_path)?;
         log::info!(
-            "Saved dense colored world map (first visit only): {} points in {} cells \
-             ({:.1} points/cell, {} points discarded by closer views) → {}",
+            "Saved dense colored world map: {} points ({} from the best visit of each tile, \
+             {} filling cells missing from it) in {} cells, {} tiles; buffered {} points from \
+             {} frames; built in {:.2?} → {}",
             dense_summary.points,
+            dense_summary.primary_points,
+            dense_summary.fill_points,
             dense_summary.cells,
-            dense_summary.points as f64 / dense_summary.cells.max(1) as f64,
-            dense_summary.discarded_points,
+            dense_summary.tiles,
+            dense_summary.buffered_points,
+            dense_summary.frames,
+            dense_build_start.elapsed(),
             dense_world_map_rgb_path,
         );
+        if DENSE_COLOR_SAVE_FRAME_INDEX {
+            let path = format!(
+                "{}/voxel-{}_world_map_rgb_dense_frames.pcd",
+                save_dir, GLOBAL_MAP_VOXEL_SIZE,
+            );
+            save_pcd_xyzrgb_frame(&dense_result.points, &path)?;
+            log::info!("Saved dense colored world map with frame indices → {path}");
+        }
     }
 
     let planar_world_map_points: Vec<Point3<f32>> = slam_map
@@ -2252,11 +2271,12 @@ fn log_coloring_summary(frame_logs: &[FrameLog]) {
         frame_logs.iter().map(|log| get(&log.coloring)).sum()
     };
     log::info!(
-        "  dense color map: stored {} points, dropped {} points in locked cells, \
-         replaced {} cells by closer views",
+        "  dense color map: buffered {} points from {} frames",
         total(|c| c.dense_points_stored),
-        total(|c| c.dense_points_dropped_locked),
-        total(|c| c.dense_cells_replaced),
+        frame_logs
+            .iter()
+            .filter(|log| log.coloring.dense_points_stored > 0)
+            .count(),
     );
 }
 
